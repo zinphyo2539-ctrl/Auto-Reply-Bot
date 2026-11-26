@@ -1,0 +1,1285 @@
+7777club — MASTER FORENSIC AUDIT, SECURITY ARCHITECTURE FINALIZATION & IMPLEMENTATION-READY BLUEPRINT
+
+Project: 7777club VIP Gaming Telegram AI Customer Support & Manual Admin Management System
+
+Audit Environment: Google AI Studio Workspace "/app/applet"
+
+Audit Mode: COMPREHENSIVE READ-ONLY FORENSIC INVESTIGATION + ARCHITECTURE FINALIZATION + IMPLEMENTATION BLUEPRINT
+
+Execution Policy: ZERO MODIFICATIONS. ZERO RESOURCE CREATION. ZERO DEPLOYMENTS. ZERO SECRET OPERATIONS.
+
+---
+
+0. PRIMARY MISSION
+
+Conduct one comprehensive, evidence-driven investigation of the entire 7777club project.
+
+The purpose is to resolve all outstanding architectural, deployment, security, database, Telegram integration, automation, financial authorization, and operational questions before implementation begins.
+
+Do not merely repeat previous audit reports.
+
+Independently inspect the current repository, installed dependencies, Wrangler implementation, source code, SQL migrations, tests, configuration files, and available local evidence.
+
+Use previous audit findings as investigation leads, not unquestionable facts.
+
+The final deliverable must be an implementation-ready technical blueprint with:
+
+1. A definitive architecture recommendation.
+2. A complete deployment identity and CI/CD design.
+3. A secure staging and production separation strategy.
+4. A complete Cloudflare resource and configuration specification.
+5. A security and authorization review.
+6. A database, migration, transaction, and queue integrity review.
+7. A Telegram and AI integration review.
+8. A comprehensive testing and acceptance plan.
+9. A precise list of required repository changes.
+10. A sequential implementation plan with explicit approval gates.
+
+The objective is to finish the design and eliminate ambiguity, not to start coding.
+
+1. NON-NEGOTIABLE EXECUTION RESTRICTIONS
+
+This is a STRICT READ-ONLY assignment.
+
+You are NOT authorized to:
+
+- Edit existing files.
+- Create new files.
+- Delete files.
+- Rename files.
+- Install or uninstall packages.
+- Update package versions.
+- Modify lockfiles.
+- Run automatic formatters that change files.
+- Create Cloudflare Workers.
+- Create D1 databases.
+- Create Queues.
+- Create KV namespaces.
+- Create R2 buckets.
+- Create any other Cloudflare resource.
+- Upload, retrieve, print, or rotate secrets.
+- Apply local or remote migrations.
+- Change Cloudflare Dashboard settings.
+- Change GitHub repository settings.
+- Modify Cloudflare Workers Builds configuration.
+- Register, delete, or change Telegram webhooks.
+- Send Telegram messages.
+- Perform actual financial operations.
+- Deploy any Worker or application.
+- Change production configuration.
+
+Read-only inspection, static analysis, local tests, and non-deploying dry-run validation are permitted.
+
+If a command could modify remote state, DO NOT execute it.
+
+If a test could modify persistent data, inspect it first and do not execute it unless it is demonstrably isolated and non-destructive.
+
+Do not claim a check passed unless it was actually executed.
+
+---
+
+2. PROJECT BUSINESS RULES — AUTHORITATIVE
+
+The system is a Telegram-only customer support and manual admin management application.
+
+2.1 Customer Interface
+
+Customers interact with the bot through Telegram private chat.
+
+The system must not introduce:
+
+- Public website.
+- Public dashboard.
+- Telegram Mini App.
+- Separate customer mobile application.
+- Unapproved external admin interface.
+
+The authorized communication surfaces are:
+
+1. Customer private Telegram chat.
+2. Private Admin Support Group.
+3. Private SUPER_ADMIN Telegram chat.
+
+2.2 Financial Processing Rules
+
+Customers may submit:
+
+- Deposit requests.
+- Withdrawal requests.
+
+Both request types are submitted through Telegram.
+
+Authorized human administrators manually perform all actual financial processing.
+
+The bot and AI may:
+
+- Collect requests.
+- Validate submitted information.
+- Record requests.
+- Provide approved instructions.
+- Answer customer support questions.
+- Escalate issues.
+- Notify administrators.
+- Notify customers after authorized admin actions.
+- Display request status.
+
+The bot and AI must NEVER:
+
+- Execute actual money transfers.
+- Execute automatic payouts.
+- Automatically approve financial requests.
+- Automatically reject financial requests.
+- Credit or debit customer wallet balances.
+- Claim a payment was completed without an authorized admin recording that result.
+- Perform financial actions based solely on AI-generated decisions.
+
+Important status semantics:
+
+- "APPROVED_FOR_PAYOUT" means approved for manual external payout. It does NOT mean payment completed.
+- "PAID_RECORDED" means an authorized SUPER_ADMIN recorded external payment completion. It does NOT mean independent payment-provider verification.
+
+2.3 Admin Roles
+
+At minimum:
+
+- "SUPER_ADMIN"
+- "SUPPORT_AGENT"
+
+SUPER_ADMIN exclusively controls withdrawal approval, rejection, and paid-status recording.
+
+SUPPORT_AGENT handles customer support but must not approve, reject, or record paid withdrawal decisions.
+
+Verify all actual role definitions in the repository and identify additional roles only if they exist in code.
+
+Authorization must be enforced server-side.
+
+Never trust:
+
+- Telegram callback data.
+- Client-provided role values.
+- Client-provided administrator IDs.
+- Message text as authorization.
+- AI-generated approval recommendations.
+
+2.4 Sensitive Data
+
+Withdrawal destination information is sensitive.
+
+Requirements:
+
+- Encrypt sensitive withdrawal PII using authenticated encryption.
+- Do not send withdrawal destination details to Gemini.
+- Do not include sensitive destination details in Admin Group messages.
+- Do not write decrypted PII to normal logs.
+- Only authorized SUPER_ADMIN private chats may receive the complete destination details.
+- Verify authorization before decryption.
+- Use authenticated encryption with appropriate associated data.
+- Protect against ciphertext substitution, cross-user record substitution, and key-version confusion.
+
+2.5 SUPER_ADMIN Initialization
+
+Telegram bots cannot initiate a private conversation with a user who has never started the bot.
+
+The SUPER_ADMIN must privately send "/start" to the bot before receiving private notifications.
+
+Do not assume Telegram provides reliable online-presence information.
+
+2.6 Official Channel
+
+"https://t.me/slotmyanmar77777"
+
+2.7 Unconfirmed Configuration
+
+The following usernames and IDs must not be invented:
+
+- "TELEGRAM_BOT_USERNAME"
+- "TELEGRAM_ADMIN_GROUP_ID"
+- "SUPER_ADMIN_IDS"
+
+Treat these as pending owner configuration.
+
+Never substitute example IDs or placeholder values as real configuration.
+
+---
+
+3. APPROVED TECHNOLOGY DIRECTION
+
+The intended production architecture is:
+
+- Cloudflare Workers.
+- Hono.
+- Cloudflare D1.
+- Cloudflare Queues.
+- Cloudflare Cron Triggers.
+- Cloudflare encrypted Secrets.
+- Telegram Bot API.
+- Gemini API.
+
+The following are NOT intended as production runtime components:
+
+- Firebase.
+- Firestore.
+- Cloud Run.
+- Cloud Tasks.
+- Cloud Scheduler.
+- Express.
+- Docker-based production runtime.
+
+Google AI Studio is a development and code-generation environment, not the production application runtime.
+
+R2 is optional for a future media archival requirement. The current design should retain Telegram file IDs and avoid downloading media unless an explicitly approved feature requires it.
+
+Do not add unnecessary services, infrastructure, or dependencies.
+
+---
+
+4. COMPLETE REPOSITORY FORENSIC AUDIT
+
+Inspect the complete project.
+
+At minimum inspect:
+
+- "package.json"
+- Lockfiles
+- "wrangler.jsonc"
+- ".env.example"
+- README
+- All files under "src/worker/"
+- All SQL migrations
+- All tests
+- Build scripts
+- Test scripts
+- TypeScript configuration
+- Installed Wrangler package and version
+- Wrangler configuration schema
+- Relevant Wrangler implementation code
+
+Identify the complete application architecture.
+
+Produce a source-code inventory containing:
+
+Component| File| Responsibility| Dependencies| Risk
+
+Inspect every runtime entry point:
+
+- "fetch"
+- "queue"
+- "scheduled"
+
+Inspect every Telegram update handler, callback handler, authentication path, admin action, database operation, queue operation, and AI integration.
+
+Identify:
+
+- Dead code.
+- Duplicate business logic.
+- Missing authorization checks.
+- Missing validation.
+- Unhandled exceptions.
+- Race conditions.
+- Unbounded operations.
+- Unsafe retries.
+- Inconsistent status transitions.
+- Data retention defects.
+- Incorrect error handling.
+
+Do not make changes.
+
+All important findings must include exact file paths and line references.
+
+---
+
+5. DEPLOYMENT IDENTITY RECONCILIATION
+
+The following identity information has been reported:
+
+GitHub repository:
+
+"Auto Reply Bot"
+
+Existing Cloudflare Worker:
+
+"auto-reply-bot"
+
+Existing Worker URL:
+
+"https://auto-reply-bot.zentrymodernization.workers.dev"
+
+Current Wrangler top-level name:
+
+"vip-gaming-bot"
+
+Existing named environments:
+
+- "env.staging"
+- "env.production"
+
+Previously reported live Worker state:
+
+- Service: "auto-reply-bot"
+- Version: v7
+- Traffic: 100%
+- Bindings: zero
+- System tag: "cf:service=vip-gaming-bot"
+
+Previously reported Cloudflare account state:
+
+- No D1 databases.
+- No Queues.
+- No KV namespaces.
+- No Worker named "vip-gaming-bot".
+- Existing service "auto-reply-bot".
+
+Treat these as owner-supplied audit evidence unless independently verified.
+
+5.1 Wrangler CI Name Override
+
+Wrangler version previously inspected:
+
+"4.168.0"
+
+The following environment variable was identified:
+
+"WRANGLER_CI_OVERRIDE_NAME"
+
+The previous audit reported that Wrangler's CI override logic can replace the Worker name resolved from Wrangler configuration.
+
+A six-test local dry-run matrix reportedly showed:
+
+CI Override| Command| Resolved Worker
+Unset| Bare deploy| vip-gaming-bot
+Unset| --env staging| vip-gaming-bot-staging
+Unset| --env production| vip-gaming-bot-production
+auto-reply-bot| Bare deploy| auto-reply-bot
+auto-reply-bot| --env staging| auto-reply-bot
+auto-reply-bot| --env production| auto-reply-bot
+
+The previous dry-run also showed that staging configuration could be redirected to the existing "auto-reply-bot" Worker when the CI override was present.
+
+Independently recheck this against the installed Wrangler version.
+
+Do not rely on outdated line numbers or assumptions.
+
+5.2 Remote CI Evidence
+
+The AI Studio workspace previously lacked Cloudflare authentication and Git metadata.
+
+Recheck available evidence.
+
+Do not pretend to access:
+
+- Cloudflare Dashboard.
+- Cloudflare Workers Builds settings.
+- GitHub repository settings.
+- Remote Build logs.
+- Cloudflare deployment history.
+
+If access is unavailable, clearly state the evidence gap.
+
+Provide exact instructions for the owner to retrieve:
+
+- Build Command.
+- Deploy Command.
+- Branch.
+- Commit SHA.
+- Build ID.
+- Wrangler warning output.
+- Deployment version details.
+
+Distinguish:
+
+- Confirmed.
+- Strongly supported.
+- Likely.
+- Unverified.
+- Contradicted.
+
+A local dry-run cannot independently prove what a remote Build actually executed.
+
+---
+
+6. FINAL STAGING AND PRODUCTION ARCHITECTURE
+
+Evaluate the architectures independently.
+
+Architecture A — Dedicated Staging and Production Workers
+
+Recommended starting hypothesis:
+
+Production:
+
+"auto-reply-bot"
+
+Staging:
+
+"auto-reply-bot-staging"
+
+Separate:
+
+- Worker services.
+- D1 databases.
+- Queue resources.
+- Queue consumers.
+- Secrets.
+- Telegram bot tokens.
+- Telegram webhooks.
+- Cron schedules.
+- Deployment pipelines.
+- Version histories.
+
+Staging must never access production financial data or production credentials.
+
+Production must never process staging requests or staging test records.
+
+Architecture B — Shared Worker Temporarily Used for Staging
+
+Evaluate the operational and security risks of temporarily deploying staging configuration to "auto-reply-bot".
+
+Do not select this merely because it is easier.
+
+6.1 Final Architecture Decision
+
+Make a professional recommendation based on:
+
+- Security.
+- Isolation.
+- Operational complexity.
+- Deployment safety.
+- Rollback.
+- Queue ownership.
+- Telegram webhook management.
+- Future maintainability.
+- Cost.
+
+Architecture A is the preferred starting hypothesis, but validate it independently.
+
+Explain whether the existing GitHub/Cloudflare Workers Builds integration attached to "auto-reply-bot" can safely deploy to a separate staging Worker.
+
+If not, specify the safest independent staging pipeline.
+
+Evaluate:
+
+1. Separate Cloudflare Workers Builds integration.
+2. GitHub Actions with a dedicated staging environment.
+3. Local Wrangler deployment by an authorized operator.
+
+Select the safest practical approach.
+
+Do not configure any of them.
+
+---
+
+7. PRE-DEPLOY GUARD AND CI/CD SECURITY
+
+The previous audit proposed using Wrangler "build.command" as a fail-closed guard.
+
+Independently validate the implementation details.
+
+Investigate:
+
+- When "build.command" executes.
+- Whether it runs before authentication and upload.
+- Whether it runs during "wrangler deploy".
+- Whether it runs during "wrangler versions upload".
+- How environment-specific build configuration is resolved.
+- Whether CLI flags are passed to the child process.
+- Whether "CLOUDFLARE_ENV" is set automatically.
+- Whether "WRANGLER_CI_OVERRIDE_NAME" is inherited.
+- Whether "--no-bundle" bypasses it.
+- Whether "--build=false" bypasses it.
+- Whether another Wrangler config file can bypass it.
+
+7.1 Guard Design
+
+Evaluate a per-environment guard design:
+
+Top-level:
+
+"--target=top-level"
+
+Staging:
+
+"--target=staging"
+
+Production:
+
+"--target=production"
+
+The guard should validate:
+
+- Allowed target environment.
+- Exact expected Worker name.
+- CI override name.
+- Expected D1 database ID.
+- Expected Queue names.
+- Placeholder configuration.
+- Required non-secret variables.
+- Required Secret names, where verifiable.
+- Production deployment approval.
+- Staging/production resource isolation.
+- Environment-specific Cron configuration.
+
+A top-level bare deploy should fail closed.
+
+A staging deployment executed through a production-bound CI pipeline must fail closed if the resolved target would be production.
+
+A production deployment must require an explicit protected deployment workflow.
+
+7.2 Independent Protection
+
+Do not rely only on a repository script that can be modified in the same repository.
+
+Evaluate independent protections:
+
+- GitHub protected branches.
+- GitHub Environment approvals.
+- Restricted deployment credentials.
+- Separate staging and production credentials.
+- Cloudflare Workers Builds branch restrictions.
+- Separate deployment pipelines.
+- CI policy checks.
+- Restricted access to production secrets.
+- Audit logging.
+
+Explain which controls are preventive and which are only detective.
+
+Do not claim absolute protection unless technically justified.
+
+---
+
+8. CLOUDFLARE RESOURCE BLUEPRINT
+
+Determine the exact required Cloudflare resources from actual source code.
+
+The previous audit reported the following required bindings:
+
+- "DB" — D1.
+- "OUTBOX_QUEUE" — Queue producer.
+- Primary Queue consumer.
+- DLQ consumer.
+
+It reported no source-code use of:
+
+- KV.
+- Durable Objects.
+- R2.
+- Vectorize.
+- Hyperdrive.
+- Service Bindings.
+- "COUNTER".
+
+Verify every item independently.
+
+Prepare a complete resource inventory:
+
+Environment| Resource| Proposed Name| Purpose| Required?
+Staging| Worker| auto-reply-bot-staging| Staging runtime| Yes
+Production| Worker| auto-reply-bot| Production runtime| Yes
+Staging| D1| vip-gaming-d1-staging| Staging database| Verify
+Production| D1| vip-gaming-d1-prod| Production database| Verify
+Staging| Queue| vip-outbox-queue-staging| Outbox| Verify
+Staging| Queue| vip-outbox-dlq-staging| DLQ| Verify
+Production| Queue| vip-outbox-queue-prod| Outbox| Verify
+Production| Queue| vip-outbox-dlq-prod| DLQ| Verify
+
+For each resource specify:
+
+- Creation order.
+- Dependencies.
+- Binding name.
+- Environment.
+- Ownership.
+- Required configuration.
+- Failure behavior.
+- Rollback considerations.
+
+Do not create resources.
+
+Do not invent D1 UUIDs.
+
+---
+
+9. CONFIGURATION AND SECRET MANAGEMENT
+
+Audit every variable and Secret used by the code.
+
+Reported required Secrets:
+
+- "TELEGRAM_BOT_TOKEN"
+- "TELEGRAM_WEBHOOK_SECRET"
+- "GEMINI_API_KEY"
+- "WITHDRAWAL_PII_ENCRYPTION_KEY"
+
+Reported optional rotation Secrets:
+
+- "TELEGRAM_WEBHOOK_SECRET_PREVIOUS"
+- "WITHDRAWAL_PII_ENCRYPTION_KEY_PREVIOUS"
+
+Reported non-secret variables include:
+
+- "ENVIRONMENT"
+- "TELEGRAM_BOT_USERNAME"
+- "TELEGRAM_ADMIN_GROUP_ID"
+- "SUPER_ADMIN_IDS"
+- "OFFICIAL_CHANNEL_URL"
+- "GEMINI_MODEL"
+- "APP_TIMEZONE"
+- "ENCRYPTION_KEY_VERSION"
+- All retention settings.
+
+Verify every name against the actual source code.
+
+9.1 Secret Exposure History
+
+Previous owner-provided Cloudflare audit reported that earlier Worker versions v1–v6 had three plaintext values:
+
+- "GEMINI_API_KEY"
+- "TELEGRAM_BOT_TOKEN"
+- "TELEGRAM_WEBHOOK_SECRET"
+
+Version v7 reportedly had zero bindings.
+
+Treat those three credentials as potentially compromised.
+
+Do not retrieve or print them.
+
+Do not assume the encryption key was previously exposed unless evidence supports that.
+
+Classify every Secret:
+
+1. Previously exposed / rotate before production.
+2. New Secret requiring initial generation.
+3. Exposure status unknown.
+4. Optional rotation fallback.
+
+9.2 Encryption Key History
+
+The absence of a Cloudflare D1 database does NOT automatically prove that no historical encrypted data exists elsewhere.
+
+Investigate:
+
+- Local D1 files.
+- Local backups.
+- Exported database files.
+- Repository fixtures.
+- Test data.
+- External database references.
+- Cloudflare backup history if accessible.
+- Ciphertext persistence locations.
+
+Do not assume a new AES-256-GCM key can decrypt old ciphertext.
+
+Specify a safe key lifecycle and versioning strategy.
+
+9.3 Plaintext Variables
+
+Evaluate two approaches:
+
+A. Wrangler configuration as source of truth.
+
+B. Cloudflare Dashboard variables with "keep_vars: true".
+
+Determine the correct behavior for the installed Wrangler version.
+
+Explain risks of each approach.
+
+Do not request actual tokens or secret values in chat.
+
+Use placeholders only in the blueprint and label them clearly as placeholders.
+
+---
+
+10. DATABASE AND FINANCIAL INTEGRITY AUDIT
+
+Inspect all five existing SQL migrations and every database access function.
+
+Audit:
+
+- Schema correctness.
+- Foreign keys.
+- Unique constraints.
+- Check constraints.
+- Indexes.
+- Status transitions.
+- Transaction boundaries.
+- Concurrency.
+- Idempotency.
+- Duplicate Telegram updates.
+- Duplicate callback processing.
+- Queue redelivery.
+- Dead-letter handling.
+- Audit log immutability.
+- Data retention.
+- PII deletion.
+- Backup and restore.
+
+Verify that all financial actions are performed only by authorized server-side functions.
+
+Check whether any SUPPORT_AGENT route can indirectly invoke a SUPER_ADMIN financial action.
+
+Check whether stale callback buttons can repeat an operation.
+
+Check whether Telegram retries can create duplicate requests.
+
+Check whether concurrent Admin decisions can produce conflicting results.
+
+Evaluate D1 transaction semantics and whether the implementation uses supported transaction mechanisms correctly in Cloudflare Workers.
+
+Do not assume that a transaction spanning separate Queue operations is atomic.
+
+Produce a status-transition matrix for Deposit and Withdrawal.
+
+For every transition specify:
+
+- Previous status.
+- Next status.
+- Authorized role.
+- Required conditions.
+- Database transaction.
+- Audit event.
+- Customer notification.
+- Queue behavior.
+- Idempotency key.
+- Failure behavior.
+
+Identify any financial integrity defect as a blocker.
+
+---
+
+11. OUTBOX, QUEUE AND CRON RELIABILITY
+
+Audit the Outbox implementation in depth.
+
+Verify:
+
+- Atomic creation of business record and outbox event.
+- Queue publication.
+- Retry behavior.
+- Duplicate delivery.
+- Consumer idempotency.
+- Dead-letter queue behavior.
+- Message expiry.
+- Failed notification handling.
+- Scheduled recovery.
+- Queue visibility timeout.
+- Maximum attempts.
+- Cron overlap.
+- Scheduled task concurrency.
+
+Determine whether the Cron schedules currently declared at top level can run against an environment without required bindings.
+
+Specify the correct environment-specific Cron strategy.
+
+Do not assume that removing top-level Cron triggers is sufficient without testing all deployment modes.
+
+---
+
+12. TELEGRAM INTEGRATION AND SECURITY
+
+Audit the complete Telegram integration.
+
+Verify:
+
+- Webhook secret validation.
+- Telegram update authentication.
+- Duplicate update protection.
+- Callback query authorization.
+- Private chat restrictions.
+- Admin group identification.
+- SUPER_ADMIN initialization.
+- User identification.
+- Message editing.
+- Telegram API failures.
+- Rate limiting.
+- Message formatting.
+- Notification retries.
+- Webhook registration.
+- Webhook rotation.
+- Webhook recovery.
+
+Evaluate whether the webhook endpoint can be abused by unauthorized callers.
+
+Verify that all admin callbacks re-check authorization on the server.
+
+Do not rely on hidden buttons as security.
+
+Prepare an environment-specific Telegram configuration plan:
+
+- Staging Bot.
+- Production Bot.
+- Staging webhook.
+- Production webhook.
+- Admin Group.
+- SUPER_ADMIN private chat.
+
+Do not call Telegram APIs or change any webhook.
+
+---
+
+13. GEMINI AI SECURITY AND OPERATIONAL BOUNDARIES
+
+Inspect the AI integration.
+
+Verify:
+
+- System prompt.
+- User input handling.
+- Prompt injection resistance.
+- Tool permissions.
+- AI escalation.
+- AI fallback.
+- API timeout.
+- Rate limits.
+- Cost control.
+- Logging.
+- Sensitive data filtering.
+- Model output validation.
+
+The AI must not possess financial authority.
+
+It must never:
+
+- Approve withdrawals.
+- Reject withdrawals.
+- Mark withdrawals paid.
+- Modify customer balances.
+- Override Admin authorization.
+- Execute database financial mutations.
+
+Determine whether AI responses are restricted to approved support information and controlled business context.
+
+If the AI is unavailable, the system must fail safely and escalate to human support where appropriate.
+
+Never send encrypted or decrypted withdrawal destination PII to Gemini.
+
+---
+
+14. DATA PRIVACY, LOGGING AND RETENTION
+
+Inspect all logging and persistence paths.
+
+Determine whether any of the following can leak:
+
+- Telegram Bot Token.
+- Webhook secret.
+- Gemini API key.
+- Encryption key.
+- Withdrawal destination PII.
+- Customer phone numbers.
+- Telegram user IDs.
+- Admin credentials.
+- Sensitive callback payloads.
+
+Review:
+
+- Application logs.
+- Audit logs.
+- Queue payloads.
+- Error logs.
+- Database records.
+- Telegram messages.
+- AI prompts.
+- Retention schedules.
+
+Verify that retention policies do not accidentally delete financial audit evidence required for investigation.
+
+Verify that immutable audit logs cannot be modified by ordinary application roles.
+
+Recommend appropriate privacy and retention controls without making legal compliance claims that have not been verified.
+
+---
+
+15. SECURITY THREAT MODEL
+
+Create a threat model covering:
+
+- Unauthorized Telegram user.
+- Malicious customer.
+- Compromised SUPPORT_AGENT.
+- Compromised SUPER_ADMIN.
+- Stolen Bot Token.
+- Exposed Gemini API Key.
+- Forged Telegram webhook.
+- Replay attack.
+- Duplicate update.
+- Callback tampering.
+- Prompt injection.
+- Queue message replay.
+- D1 race condition.
+- SQL injection.
+- PII leakage.
+- Secret leakage.
+- Compromised GitHub account.
+- Compromised Cloudflare account.
+- Malicious or accidental deployment.
+- Staging-to-production contamination.
+- Supply-chain dependency compromise.
+
+For each threat report:
+
+Threat| Attack Path| Existing Control| Gap| Severity| Required Remediation
+
+Use evidence from actual source code.
+
+Do not invent vulnerabilities.
+
+Do not claim OWASP ASVS compliance unless the relevant requirements have been verified.
+
+---
+
+16. TESTING AND QUALITY ASSURANCE
+
+Independently inspect and run safe local tests where possible.
+
+Previously reported status:
+
+- "npm run lint": PASS.
+- "npm run build:worker": PASS.
+- "npm test": PASS.
+- 5/5 test files.
+- 52/52 tests.
+
+These results must be independently reproduced if the workspace permits.
+
+Identify missing tests.
+
+At minimum plan:
+
+1. Unit tests.
+2. Integration tests.
+3. Database migration tests.
+4. Authorization tests.
+5. Telegram webhook tests.
+6. Queue redelivery tests.
+7. Idempotency tests.
+8. Concurrency tests.
+9. Encryption/decryption tests.
+10. Key rotation tests.
+11. PII redaction tests.
+12. AI prompt injection tests.
+13. Staging isolation tests.
+14. Production deployment guard tests.
+15. Backup and restore tests.
+16. Disaster recovery tests.
+
+Produce an explicit pass/fail acceptance matrix.
+
+Do not invent test results.
+
+---
+
+17. OBSERVABILITY, BACKUP AND DISASTER RECOVERY
+
+Define the required operational design.
+
+Evaluate:
+
+- Worker error monitoring.
+- D1 query failure monitoring.
+- Queue backlog monitoring.
+- DLQ alerts.
+- Telegram delivery failure monitoring.
+- Gemini failure monitoring.
+- Audit event integrity checks.
+- Secret rotation monitoring.
+- Backup schedule.
+- Restore testing.
+- Recovery Point Objective.
+- Recovery Time Objective.
+
+Do not promise specific availability or recovery targets without supporting infrastructure and testing.
+
+Distinguish proposed targets from verified capabilities.
+
+---
+
+18. COST AND OPERATIONAL COMPLEXITY
+
+Evaluate the expected cost structure for the selected Cloudflare architecture.
+
+Identify:
+
+- Workers usage.
+- D1 storage and operations.
+- Queue operations.
+- Cron execution.
+- Logs.
+- Optional external AI costs.
+- Optional future storage.
+
+Use current pricing documentation only if web access is available and explicitly permitted.
+
+Otherwise provide a pricing checklist without inventing current prices.
+
+Avoid introducing unnecessary services or recurring costs.
+
+---
+
+19. FINAL ARCHITECTURE DECISIONS
+
+Make autonomous engineering decisions where possible.
+
+The owner expects practical decisions based on:
+
+- Security.
+- Reliability.
+- Industry best practices.
+- Cloudflare platform constraints.
+- Telegram API constraints.
+- Database integrity.
+- Maintainability.
+- Cost.
+
+Do not ask the owner to choose technical details that can be resolved through engineering analysis.
+
+For each decision provide:
+
+Decision| Recommended Choice| Reason| Alternatives Rejected| Owner Approval Required?
+
+Distinguish:
+
+- Engineering recommendations.
+- Business decisions.
+- Credential ownership requirements.
+- External provider requirements.
+- Legal or licensing requirements.
+- Actions requiring explicit owner authorization.
+
+Do not treat an engineering recommendation as owner approval.
+
+---
+
+20. REQUIRED IMPLEMENTATION BLUEPRINT
+
+After completing all investigations, prepare the exact proposed implementation plan.
+
+Do not execute it.
+
+20.1 Proposed File Change Register
+
+For every proposed repository change:
+
+File Path| Change Type| Exact Purpose| Dependency| Risk| Tests
+
+Include new files that would be needed.
+
+For each modified file, explain the proposed changes and relevant configuration fields.
+
+Do not fabricate line numbers for files that do not exist.
+
+20.2 Wrangler Configuration Blueprint
+
+Prepare the complete proposed environment structure for:
+
+- Top-level configuration.
+- Staging.
+- Production.
+
+Include:
+
+- Worker names.
+- D1 bindings.
+- Queue producer bindings.
+- Queue consumer configuration.
+- Cron configuration.
+- Variables.
+- Secret requirements.
+- Environment-specific build commands.
+- Deployment protection.
+
+Ensure staging and production are unambiguously separated.
+
+Do not include real secret values.
+
+Do not use fake database UUIDs as actual values.
+
+Clearly mark unresolved resource IDs.
+
+20.3 Deployment Pipeline Blueprint
+
+Specify:
+
+- GitHub branch strategy.
+- Cloudflare Workers Builds configuration.
+- Independent staging deployment.
+- Production deployment approval.
+- CI/CD credentials.
+- Deployment guards.
+- Rollback process.
+- Post-deployment health checks.
+
+Ensure a staging deployment cannot overwrite the production Worker through "WRANGLER_CI_OVERRIDE_NAME".
+
+20.4 Exact Command Register
+
+Provide the exact future commands in execution order.
+
+Classify each command:
+
+- READ-ONLY.
+- LOCAL FILE MODIFICATION.
+- RESOURCE CREATION.
+- SECRET OPERATION.
+- DATABASE MIGRATION.
+- WEBHOOK MUTATION.
+- DEPLOYMENT.
+- PRODUCTION MUTATION.
+
+All mutating commands must be clearly labeled:
+
+"NOT AUTHORIZED — DO NOT EXECUTE"
+
+Do not execute them.
+
+---
+
+21. OWNER DECISION REGISTER
+
+List only the genuinely unresolved owner decisions.
+
+Do not ask for technical choices that the audit can resolve.
+
+For each required owner decision include:
+
+- Exact question.
+- Recommended default.
+- Why approval is required.
+- Consequences of each option.
+- Whether it blocks implementation.
+- Whether it blocks staging only or production too.
+
+Do not ask the owner to paste secrets, API keys, encryption keys, or private credentials into the conversation.
+
+Use secure local or Cloudflare Secret configuration procedures in the blueprint.
+
+---
+
+22. FINAL DELIVERABLE FORMAT
+
+Return one comprehensive report with these sections:
+
+A. Executive Summary.
+
+B. Repository and Runtime Architecture Inventory.
+
+C. Deployment Identity Reconciliation.
+
+D. Wrangler CI Override Findings.
+
+E. Remote Deployment Evidence and Gaps.
+
+F. Definitive Staging/Production Architecture Recommendation.
+
+G. Cloudflare Resource Inventory.
+
+H. Wrangler Configuration Blueprint.
+
+I. Secret and Credential Lifecycle.
+
+J. Database and Financial Integrity Audit.
+
+K. Outbox, Queue and Cron Reliability.
+
+L. Telegram Integration Security.
+
+M. Gemini AI Security.
+
+N. Data Privacy and Retention.
+
+O. Threat Model.
+
+P. Testing and Acceptance Matrix.
+
+Q. Backup, Monitoring and Disaster Recovery.
+
+R. Cost and Operational Considerations.
+
+S. Proposed Repository File Change Register.
+
+T. Exact Future Deployment Plan.
+
+U. Owner Decision Register.
+
+V. Final Readiness Verdict.
+
+For every important finding include:
+
+- Evidence.
+- File path.
+- Line number.
+- Test result if executed.
+- Classification.
+- Severity.
+- Recommended action.
+
+Use these classifications consistently:
+
+- CONFIRMED.
+- STRONGLY SUPPORTED.
+- LIKELY.
+- UNVERIFIED.
+- CONTRADICTED.
+- NOT APPLICABLE.
+
+Use these severity levels:
+
+- CRITICAL.
+- HIGH.
+- MEDIUM.
+- LOW.
+- INFORMATIONAL.
+
+---
+
+23. FINAL READINESS VERDICT
+
+Provide three separate readiness verdicts:
+
+1. Repository Readiness
+
+Is the current source code sufficiently correct and secure to begin staging preparation?
+
+2. Staging Readiness
+
+What exact blockers prevent a safe staging deployment?
+
+3. Production Readiness
+
+What exact blockers prevent a safe production launch?
+
+Do not combine these into one vague PASS/FAIL.
+
+Provide a checklist showing:
+
+- Resolved.
+- Partially resolved.
+- Unresolved.
+- Owner approval required.
+- External verification required.
+
+---
+
+24. FINAL ABSOLUTE RULE
+
+The task is complete only when the architecture, deployment strategy, security design, resource requirements, implementation changes, test requirements, and owner decisions are documented clearly enough that implementation can begin without reopening the same architectural questions.
+
+However:
+
+DO NOT IMPLEMENT ANYTHING.
+
+DO NOT MODIFY ANY FILE.
+
+DO NOT CREATE ANY RESOURCE.
+
+DO NOT UPLOAD OR ROTATE ANY SECRET.
+
+DO NOT RUN ANY REMOTE MIGRATION.
+
+DO NOT CHANGE ANY TELEGRAM WEBHOOK.
+
+DO NOT DEPLOY.
+
+Finish by reporting:
+
+"READ-ONLY MASTER AUDIT COMPLETED — IMPLEMENTATION NOT AUTHORIZED"
+
+Also report the exact number of files modified, resources created, secrets changed, migrations applied, webhook changes, and deployments performed. All must be zero.
