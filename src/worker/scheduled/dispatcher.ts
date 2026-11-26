@@ -50,16 +50,12 @@ export const scheduledDispatcher = {
       } else if (row.status === 'SENDING') {
         if (row.is_idempotent_method === 1) {
           // Idempotent editMessageText can safely retry when lease expired
-          const res = await env.DB
-            .prepare(
-              `UPDATE outbox
-               SET status = 'RETRYABLE_FAILURE', available_at = ?2, next_dispatch_at = ?2,
-                   lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?2
-               WHERE outbox_id = ?1 AND status = 'SENDING' AND lease_expires_at <= ?2`
-            )
-            .bind(row.outbox_id, nowMs)
-            .run();
-          if (res.meta.changes === 1) {
+          const recovered = await outboxRepository.recoverExpiredSendingIdempotentRow(
+            env.DB,
+            row.outbox_id,
+            nowMs
+          );
+          if (recovered) {
             expiredClaimedRecovered++;
           }
         } else {

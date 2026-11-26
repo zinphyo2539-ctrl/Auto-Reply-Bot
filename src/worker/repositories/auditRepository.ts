@@ -1,6 +1,12 @@
 import type { D1Database, D1PreparedStatement, D1Result } from '../types/bindings';
 import type { AuditLogRow, AuditRetentionCheckpointRow } from '../types/domain';
-import { computeAuditCheckpointHash, computeAuditEntryHash } from '../lib/crypto';
+import {
+  CURRENT_AUDIT_HASH_VERSION,
+  CURRENT_CHECKPOINT_HASH_VERSION,
+  computeAuditCheckpointHash,
+  computeAuditEntryHash,
+  serializeCanonicalJson,
+} from '../lib/crypto';
 import { DatabaseError } from '../lib/errors';
 import { generatePrefixedId } from '../lib/ids';
 
@@ -63,6 +69,12 @@ export const auditRepository = {
   ): Promise<D1PreparedStatement> {
     const auditId = input.auditId ?? generatePrefixedId('aud', input.nowMs);
     const prevHash = explicitPrevHash ?? (await this.getLatestHash(db));
+    const beforeJson = serializeCanonicalJson(input.beforeState);
+    const afterJson = serializeCanonicalJson(input.afterState);
+    const reason = input.reason ?? null;
+    const sourceUpdateId = input.sourceUpdateId ?? null;
+    const hashVersion = CURRENT_AUDIT_HASH_VERSION;
+
     const entryHash = await computeAuditEntryHash({
       prevHash,
       auditId,
@@ -72,12 +84,14 @@ export const auditRepository = {
       resourceType: input.resourceType,
       resourceId: input.resourceId,
       result: input.result,
+      beforeStateJson: beforeJson,
+      afterStateJson: afterJson,
+      reason,
+      sourceUpdateId,
       createdAt: input.nowMs,
       correlationId: input.correlationId,
+      hashVersion,
     });
-
-    const beforeJson = input.beforeState ? JSON.stringify(input.beforeState) : null;
-    const afterJson = input.afterState ? JSON.stringify(input.afterState) : null;
 
     if (gateCondition) {
       return db
@@ -85,11 +99,11 @@ export const auditRepository = {
           `INSERT INTO audit_logs (
             audit_id, actor_id, actor_role, action, resource_type, resource_id, result,
             before_state_json, after_state_json, reason, correlation_id, source_update_id,
-            prev_entry_hash, entry_hash, created_at
-          ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+            prev_entry_hash, entry_hash, hash_version, created_at
+          ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
           WHERE EXISTS (
             SELECT 1 FROM ${gateCondition.table}
-            WHERE ${gateCondition.pkColumn} = ?16 AND last_mutation_token = ?17
+            WHERE ${gateCondition.pkColumn} = ?17 AND last_mutation_token = ?18
           )`
         )
         .bind(
@@ -102,11 +116,12 @@ export const auditRepository = {
           input.result,
           beforeJson,
           afterJson,
-          input.reason ?? null,
+          reason,
           input.correlationId,
-          input.sourceUpdateId ?? null,
+          sourceUpdateId,
           prevHash,
           entryHash,
+          hashVersion,
           input.nowMs,
           gateCondition.pkValue,
           gateCondition.mutationToken
@@ -118,8 +133,8 @@ export const auditRepository = {
         `INSERT INTO audit_logs (
           audit_id, actor_id, actor_role, action, resource_type, resource_id, result,
           before_state_json, after_state_json, reason, correlation_id, source_update_id,
-          prev_entry_hash, entry_hash, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`
+          prev_entry_hash, entry_hash, hash_version, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)`
       )
       .bind(
         auditId,
@@ -131,11 +146,12 @@ export const auditRepository = {
         input.result,
         beforeJson,
         afterJson,
-        input.reason ?? null,
+        reason,
         input.correlationId,
-        input.sourceUpdateId ?? null,
+        sourceUpdateId,
         prevHash,
         entryHash,
+        hashVersion,
         input.nowMs
       );
   },
@@ -248,15 +264,37 @@ export const auditRepository = {
           reason: 'CHECKPOINT_PREV_HASH_MISMATCH',
         };
       }
-      const computedCpHash = await computeAuditCheckpointHash({
-        prevCheckpointHash: cp.prev_checkpoint_hash,
-        checkpointId: cp.checkpoint_id,
-        anchorAuditId: cp.anchor_audit_id,
-        anchorEntryHash: cp.anchor_entry_hash,
-        anchorCreatedAt: cp.anchor_created_at,
-        purgedCount: cp.purged_count,
-        createdAt: cp.created_at,
-      });
+      const cpHashVersion = cp.hash_version;
+      if (typeof cpHashVersion !== 'number' || !Number.isInteger(cpHashVersion)) {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenCheckpointId: cp.checkpoint_id,
+          reason: 'UNSUPPORTED_CHECKPOINT_HASH_VERSION',
+        };
+      }
+      let computedCpHash: string;
+      try {
+        computedCpHash = await computeAuditCheckpointHash({
+          prevCheckpointHash: cp.prev_checkpoint_hash,
+          checkpointId: cp.checkpoint_id,
+          anchorAuditId: cp.anchor_audit_id,
+          anchorEntryHash: cp.anchor_entry_hash,
+          anchorCreatedAt: cp.anchor_created_at,
+          purgedCount: cp.purged_count,
+          createdAt: cp.created_at,
+          hashVersion: cpHashVersion,
+        });
+      } catch {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenCheckpointId: cp.checkpoint_id,
+          reason: 'UNSUPPORTED_CHECKPOINT_HASH_VERSION',
+        };
+      }
       if (computedCpHash !== cp.checkpoint_hash) {
         return {
           valid: false,
@@ -281,18 +319,44 @@ export const auditRepository = {
           reason: 'AUDIT_PREV_HASH_MISMATCH',
         };
       }
-      const computed = await computeAuditEntryHash({
-        prevHash: row.prev_entry_hash,
-        auditId: row.audit_id,
-        actorId: row.actor_id,
-        actorRole: row.actor_role,
-        action: row.action,
-        resourceType: row.resource_type,
-        resourceId: row.resource_id,
-        result: row.result,
-        createdAt: row.created_at,
-        correlationId: row.correlation_id,
-      });
+      const rowHashVersion = row.hash_version;
+      if (typeof rowHashVersion !== 'number' || !Number.isInteger(rowHashVersion)) {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenAuditId: row.audit_id,
+          reason: 'UNSUPPORTED_AUDIT_HASH_VERSION',
+        };
+      }
+      let computed: string;
+      try {
+        computed = await computeAuditEntryHash({
+          prevHash: row.prev_entry_hash,
+          auditId: row.audit_id,
+          actorId: row.actor_id,
+          actorRole: row.actor_role,
+          action: row.action,
+          resourceType: row.resource_type,
+          resourceId: row.resource_id,
+          result: row.result,
+          beforeStateJson: row.before_state_json,
+          afterStateJson: row.after_state_json,
+          reason: row.reason,
+          sourceUpdateId: row.source_update_id,
+          createdAt: row.created_at,
+          correlationId: row.correlation_id,
+          hashVersion: rowHashVersion,
+        });
+      } catch {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenAuditId: row.audit_id,
+          reason: 'UNSUPPORTED_AUDIT_HASH_VERSION',
+        };
+      }
       if (computed !== row.entry_hash) {
         return {
           valid: false,
@@ -351,18 +415,32 @@ export const auditRepository = {
       if (row.prev_entry_hash !== expectedPrev) {
         throw new DatabaseError(`AUDIT_RETENTION_ABORTED_BROKEN_CHAIN_AT_${row.audit_id}`);
       }
-      const computed = await computeAuditEntryHash({
-        prevHash: row.prev_entry_hash,
-        auditId: row.audit_id,
-        actorId: row.actor_id,
-        actorRole: row.actor_role,
-        action: row.action,
-        resourceType: row.resource_type,
-        resourceId: row.resource_id,
-        result: row.result,
-        createdAt: row.created_at,
-        correlationId: row.correlation_id,
-      });
+      const rowHashVersion = row.hash_version;
+      if (typeof rowHashVersion !== 'number' || !Number.isInteger(rowHashVersion)) {
+        throw new DatabaseError(`AUDIT_RETENTION_ABORTED_UNSUPPORTED_HASH_VERSION_AT_${row.audit_id}`);
+      }
+      let computed: string;
+      try {
+        computed = await computeAuditEntryHash({
+          prevHash: row.prev_entry_hash,
+          auditId: row.audit_id,
+          actorId: row.actor_id,
+          actorRole: row.actor_role,
+          action: row.action,
+          resourceType: row.resource_type,
+          resourceId: row.resource_id,
+          result: row.result,
+          beforeStateJson: row.before_state_json,
+          afterStateJson: row.after_state_json,
+          reason: row.reason,
+          sourceUpdateId: row.source_update_id,
+          createdAt: row.created_at,
+          correlationId: row.correlation_id,
+          hashVersion: rowHashVersion,
+        });
+      } catch {
+        throw new DatabaseError(`AUDIT_RETENTION_ABORTED_UNSUPPORTED_HASH_VERSION_AT_${row.audit_id}`);
+      }
       if (computed !== row.entry_hash) {
         throw new DatabaseError(`AUDIT_RETENTION_ABORTED_TAMPERED_HASH_AT_${row.audit_id}`);
       }
@@ -372,6 +450,7 @@ export const auditRepository = {
     const anchorRow = toPurge[toPurge.length - 1];
     const checkpointId = generatePrefixedId('acp', nowMs);
     const prevCheckpointHash = latestCheckpoint ? latestCheckpoint.checkpoint_hash : 'GENESIS_CHECKPOINT';
+    const checkpointHashVersion = CURRENT_CHECKPOINT_HASH_VERSION;
     const checkpointHash = await computeAuditCheckpointHash({
       prevCheckpointHash,
       checkpointId,
@@ -380,14 +459,15 @@ export const auditRepository = {
       anchorCreatedAt: anchorRow.created_at,
       purgedCount: toPurge.length,
       createdAt: nowMs,
+      hashVersion: checkpointHashVersion,
     });
 
     const insertCheckpointStmt = db
       .prepare(
         `INSERT INTO audit_retention_checkpoints (
           checkpoint_id, prev_checkpoint_hash, anchor_audit_id, anchor_entry_hash,
-          anchor_created_at, purged_count, checkpoint_hash, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+          anchor_created_at, purged_count, checkpoint_hash, hash_version, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
       )
       .bind(
         checkpointId,
@@ -397,6 +477,7 @@ export const auditRepository = {
         anchorRow.created_at,
         toPurge.length,
         checkpointHash,
+        checkpointHashVersion,
         nowMs
       );
 

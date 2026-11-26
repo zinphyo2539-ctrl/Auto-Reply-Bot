@@ -198,6 +198,7 @@ export interface CustomerSessionRow {
   key_version: number;
   target_request_type: 'DEPOSIT' | 'WITHDRAWAL' | 'SLIP' | null;
   target_request_id: string | null;
+  target_ticket_id?: string | null;
   wizard_version: number;
   started_at: number;
   expires_at: number;
@@ -325,6 +326,7 @@ export interface AuditLogRow {
   source_update_id: number | null;
   prev_entry_hash: string;
   entry_hash: string;
+  hash_version?: number;
   created_at: number;
 }
 
@@ -336,5 +338,6 @@ export interface AuditRetentionCheckpointRow {
   anchor_created_at: number;
   purged_count: number;
   checkpoint_hash: string;
+  hash_version?: number;
   created_at: number;
 }

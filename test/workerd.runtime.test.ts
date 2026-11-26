@@ -112,12 +112,13 @@ describe('Cloudflare workerd + Miniflare D1 Runtime Verification Suite (F-12)', 
       },
     });
 
-    // Apply all 4 SQL migrations sequentially against real Miniflare D1
+    // Apply all 5 SQL migrations sequentially against real Miniflare D1
     const db = await mf.getD1Database('DB');
     const files = fs
       .readdirSync(MIGRATIONS_DIR)
       .filter((f) => f.endsWith('.sql'))
       .sort();
+    expect(files.length).toBe(5);
 
     for (const file of files) {
       const rawSql = fs.readFileSync(path.join(MIGRATIONS_DIR, file), 'utf8');
@@ -134,7 +135,7 @@ describe('Cloudflare workerd + Miniflare D1 Runtime Verification Suite (F-12)', 
     }
   });
 
-  it('W1. Applies all 4 migrations cleanly in real workerd D1 with 18 tables, ai_enabled=0, and populated FAQ snapshot', async () => {
+  it('W1. Applies all 5 migrations cleanly in real workerd D1 with 18 tables, F-03/F-07 columns, ai_enabled=0, and populated FAQ snapshot', async () => {
     const db = await mf.getD1Database('DB');
     const tables = await db
       .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'")
@@ -177,6 +178,14 @@ describe('Cloudflare workerd + Miniflare D1 Runtime Verification Suite (F-12)', 
     expect(parsedFaqs.map((f) => f.faqId)).toEqual(
       expect.arrayContaining(['faq_deposit_guide', 'faq_withdrawal_guide'])
     );
+
+    // Verify migration 0005 columns exist in real workerd D1
+    const csCols = await db.prepare('PRAGMA table_info(customer_sessions)').all<{ name: string }>();
+    expect(csCols.results.map((c) => c.name)).toContain('target_ticket_id');
+    const auditCols = await db.prepare('PRAGMA table_info(audit_logs)').all<{ name: string }>();
+    expect(auditCols.results.map((c) => c.name)).toContain('hash_version');
+    const cpCols = await db.prepare('PRAGMA table_info(audit_retention_checkpoints)').all<{ name: string }>();
+    expect(cpCols.results.map((c) => c.name)).toContain('hash_version');
   });
 
   it('W2. Serves /healthz, enforces webhook secret auth & 413 body limit, processes /start, and deduplicates updates in real workerd', async () => {
@@ -309,8 +318,9 @@ describe('Cloudflare workerd + Miniflare D1 Runtime Verification Suite (F-12)', 
 
     const db = await mf.getD1Database('DB');
     const retAudit = await db
-      .prepare(`SELECT action FROM audit_logs WHERE action = 'RETENTION_CLEANUP'`)
-      .first<{ action: string }>();
+      .prepare(`SELECT action, hash_version FROM audit_logs WHERE action = 'RETENTION_CLEANUP'`)
+      .first<{ action: string; hash_version: number }>();
     expect(retAudit).not.toBeNull();
+    expect(retAudit!.hash_version).toBe(2);
   });
 });

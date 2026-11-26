@@ -53,12 +53,8 @@ export const depositRepository = {
           status, version, last_mutation_token, created_at, updated_at
         )
         SELECT
-          ?1, cs.draft_token,
-          COALESCE(
-            (SELECT ticket_id FROM support_tickets WHERE customer_id = ?2 AND status IN ('OPEN', 'ASSIGNED') LIMIT 1),
-            ?3
-          ),
-          ?2, cs.draft_amount, ?4, cs.draft_method_code, cs.draft_reference_text, NULL,
+          ?1, cs.draft_token, ?3, ?2,
+          cs.draft_amount, ?4, cs.draft_method_code, cs.draft_reference_text, NULL,
           'SUBMITTED', 1, ?5, ?6, ?6
         FROM customer_sessions cs
         JOIN config cfg ON cfg.config_id = 'active'
@@ -67,6 +63,7 @@ export const depositRepository = {
           AND cs.wizard_state = 'DEP_AWAITING_CONFIRM'
           AND cs.draft_token = ?7
           AND cs.expires_at > ?6
+          AND (cs.target_ticket_id IS NULL OR cs.target_ticket_id = ?3)
           AND cs.draft_amount >= cfg.min_deposit_amount
           AND cs.draft_amount <= cfg.max_deposit_amount
           AND EXISTS (
@@ -76,6 +73,12 @@ export const depositRepository = {
           )
           AND EXISTS (
             SELECT 1 FROM customers WHERE telegram_user_id = ?2 AND account_status = 'ACTIVE'
+          )
+          AND EXISTS (
+            SELECT 1 FROM support_tickets st
+            WHERE st.ticket_id = ?3
+              AND st.customer_id = ?2
+              AND st.status IN ('OPEN', 'ASSIGNED')
           )
         ON CONFLICT(idempotency_token) DO NOTHING
         RETURNING *`

@@ -2070,32 +2070,152 @@ async function decryptPayoutDestination(ciphertextB64, ivB64, aadContext, keys) 
   );
   return decoder.decode(decryptedBuf);
 }
+var CURRENT_AUDIT_HASH_VERSION = 2;
+var CURRENT_CHECKPOINT_HASH_VERSION = 2;
+function canonicalizeJsonValue(value) {
+  if (value === null || typeof value !== "object") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => item === void 0 ? null : canonicalizeJsonValue(item));
+  }
+  const record2 = value;
+  const sorted = {};
+  for (const key of Object.keys(record2).sort()) {
+    const val = record2[key];
+    if (val !== void 0) {
+      sorted[key] = canonicalizeJsonValue(val);
+    }
+  }
+  return sorted;
+}
+function serializeCanonicalJson(value) {
+  if (value === null || value === void 0) {
+    return null;
+  }
+  return JSON.stringify(canonicalizeJsonValue(value));
+}
+function canonicalizeNullableJsonField(name, raw2) {
+  if (raw2 === null || raw2 === void 0) {
+    return { name, type: "N", value: "" };
+  }
+  try {
+    const parsed = JSON.parse(raw2);
+    return {
+      name,
+      type: "J",
+      value: JSON.stringify(canonicalizeJsonValue(parsed))
+    };
+  } catch {
+    return {
+      name,
+      type: "R",
+      value: raw2
+    };
+  }
+}
+function makeRequiredStringField(name, value) {
+  return { name, type: "S", value };
+}
+function makeNullableStringField(name, value) {
+  if (value === null || value === void 0) {
+    return { name, type: "N", value: "" };
+  }
+  return { name, type: "S", value };
+}
+function makeRequiredIntField(name, value) {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`CANONICAL_INVALID_INTEGER_${name.toUpperCase()}`);
+  }
+  return { name, type: "I", value: String(value) };
+}
+function makeNullableIntField(name, value) {
+  if (value === null || value === void 0) {
+    return { name, type: "N", value: "" };
+  }
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`CANONICAL_INVALID_INTEGER_${name.toUpperCase()}`);
+  }
+  return { name, type: "I", value: String(value) };
+}
+function encodeCanonicalRecord(fields) {
+  const parts = [];
+  for (const field of fields) {
+    const byteLen = encoder.encode(field.value).byteLength;
+    parts.push(`${field.name}=${field.type}:${byteLen}:${field.value}
+`);
+  }
+  return parts.join("");
+}
 async function computeAuditEntryHash(params) {
-  const canonical = [
-    params.prevHash,
-    params.auditId,
-    params.actorId,
-    params.actorRole,
-    params.action,
-    params.resourceType,
-    params.resourceId,
-    params.result,
-    String(params.createdAt),
-    params.correlationId
-  ].join("|");
-  return sha256Hex(canonical);
+  const version2 = params.hashVersion ?? CURRENT_AUDIT_HASH_VERSION;
+  if (version2 === 1) {
+    const legacyCanonical = [
+      params.prevHash,
+      params.auditId,
+      params.actorId,
+      params.actorRole,
+      params.action,
+      params.resourceType,
+      params.resourceId,
+      params.result,
+      String(params.createdAt),
+      params.correlationId
+    ].join("|");
+    return sha256Hex(legacyCanonical);
+  }
+  if (version2 === 2) {
+    const canonical = encodeCanonicalRecord([
+      makeRequiredStringField("domain", "7777club.audit_entry"),
+      makeRequiredIntField("hash_version", 2),
+      makeRequiredStringField("prev_entry_hash", params.prevHash),
+      makeRequiredStringField("audit_id", params.auditId),
+      makeRequiredStringField("actor_id", params.actorId),
+      makeRequiredStringField("actor_role", params.actorRole),
+      makeRequiredStringField("action", params.action),
+      makeRequiredStringField("resource_type", params.resourceType),
+      makeRequiredStringField("resource_id", params.resourceId),
+      makeRequiredStringField("result", params.result),
+      canonicalizeNullableJsonField("before_state_json", params.beforeStateJson),
+      canonicalizeNullableJsonField("after_state_json", params.afterStateJson),
+      makeNullableStringField("reason", params.reason),
+      makeNullableIntField("source_update_id", params.sourceUpdateId),
+      makeRequiredIntField("created_at", params.createdAt),
+      makeRequiredStringField("correlation_id", params.correlationId)
+    ]);
+    return sha256Hex(canonical);
+  }
+  throw new Error(`UNSUPPORTED_AUDIT_HASH_VERSION:${String(version2)}`);
 }
 async function computeAuditCheckpointHash(params) {
-  const canonical = [
-    params.prevCheckpointHash,
-    params.checkpointId,
-    params.anchorAuditId,
-    params.anchorEntryHash,
-    String(params.anchorCreatedAt),
-    String(params.purgedCount),
-    String(params.createdAt)
-  ].join("|");
-  return sha256Hex(canonical);
+  const version2 = params.hashVersion ?? CURRENT_CHECKPOINT_HASH_VERSION;
+  if (version2 === 1) {
+    const legacyCanonical = [
+      params.prevCheckpointHash,
+      params.checkpointId,
+      params.anchorAuditId,
+      params.anchorEntryHash,
+      String(params.anchorCreatedAt),
+      String(params.purgedCount),
+      String(params.createdAt)
+    ].join("|");
+    return sha256Hex(legacyCanonical);
+  }
+  if (version2 === 2) {
+    const canonical = encodeCanonicalRecord([
+      makeRequiredStringField("domain", "7777club.audit_checkpoint"),
+      makeRequiredIntField("hash_version", 2),
+      makeRequiredStringField("prev_checkpoint_hash", params.prevCheckpointHash),
+      makeRequiredStringField("checkpoint_id", params.checkpointId),
+      makeRequiredStringField("anchor_audit_id", params.anchorAuditId),
+      makeRequiredStringField("anchor_entry_hash", params.anchorEntryHash),
+      makeRequiredIntField("anchor_created_at", params.anchorCreatedAt),
+      makeRequiredIntField("purged_count", params.purgedCount),
+      makeRequiredIntField("created_at", params.createdAt)
+    ]);
+    return sha256Hex(canonical);
+  }
+  throw new Error(`UNSUPPORTED_CHECKPOINT_HASH_VERSION:${String(version2)}`);
 }
 
 // src/worker/middleware/verifyTelegramWebhook.ts
@@ -22339,6 +22459,7 @@ var customerRepository = {
   },
   async upsertSession(db, session) {
     assertValidCustomerId(session.customer_id);
+    const targetTicketId = session.target_ticket_id ?? null;
     if (session.expectedVersion !== void 0) {
       const res = await db.prepare(
         `UPDATE customer_sessions
@@ -22354,11 +22475,12 @@ var customerRepository = {
                key_version = ?11,
                target_request_type = ?12,
                target_request_id = ?13,
+               target_ticket_id = ?14,
                wizard_version = wizard_version + 1,
-               updated_at = ?14
+               updated_at = ?15
            WHERE customer_id = ?1
-             AND wizard_version = ?15
-             AND expires_at > ?14`
+             AND wizard_version = ?16
+             AND expires_at > ?15`
       ).bind(
         session.customer_id,
         session.wizard_type,
@@ -22373,6 +22495,7 @@ var customerRepository = {
         session.key_version,
         session.target_request_type,
         session.target_request_id,
+        targetTicketId,
         session.updated_at,
         session.expectedVersion
       ).run();
@@ -22383,9 +22506,9 @@ var customerRepository = {
           customer_id, wizard_type, wizard_state, draft_token,
           draft_amount, draft_method_code, draft_reference_text,
           draft_dest_masked, draft_dest_ciphertext, draft_dest_iv,
-          key_version, target_request_type, target_request_id,
+          key_version, target_request_type, target_request_id, target_ticket_id,
           wizard_version, started_at, expires_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15, ?16)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, ?15, ?16, ?17)
         ON CONFLICT(customer_id) DO UPDATE SET
           wizard_type = excluded.wizard_type,
           wizard_state = excluded.wizard_state,
@@ -22399,6 +22522,7 @@ var customerRepository = {
           key_version = excluded.key_version,
           target_request_type = excluded.target_request_type,
           target_request_id = excluded.target_request_id,
+          target_ticket_id = excluded.target_ticket_id,
           wizard_version = customer_sessions.wizard_version + 1,
           started_at = excluded.started_at,
           expires_at = excluded.expires_at,
@@ -22417,6 +22541,7 @@ var customerRepository = {
       session.key_version,
       session.target_request_type,
       session.target_request_id,
+      targetTicketId,
       session.started_at,
       session.expires_at,
       session.updated_at
@@ -22446,8 +22571,18 @@ var ticketRepository = {
     return db.prepare(
       `SELECT * FROM support_tickets
          WHERE customer_id = ?1 AND status IN ('OPEN', 'ASSIGNED')
+         ORDER BY created_at DESC, ticket_id DESC
          LIMIT 1`
     ).bind(customerId).first();
+  },
+  async listActiveByCustomer(db, customerId, limit = 10) {
+    const res = await db.prepare(
+      `SELECT * FROM support_tickets
+         WHERE customer_id = ?1 AND status IN ('OPEN', 'ASSIGNED')
+         ORDER BY created_at DESC, ticket_id DESC
+         LIMIT ?2`
+    ).bind(customerId, limit).all();
+    return res.results;
   },
   prepareCreateIfNoActiveTicket(db, params) {
     return db.prepare(
@@ -22642,12 +22777,8 @@ var depositRepository = {
           status, version, last_mutation_token, created_at, updated_at
         )
         SELECT
-          ?1, cs.draft_token,
-          COALESCE(
-            (SELECT ticket_id FROM support_tickets WHERE customer_id = ?2 AND status IN ('OPEN', 'ASSIGNED') LIMIT 1),
-            ?3
-          ),
-          ?2, cs.draft_amount, ?4, cs.draft_method_code, cs.draft_reference_text, NULL,
+          ?1, cs.draft_token, ?3, ?2,
+          cs.draft_amount, ?4, cs.draft_method_code, cs.draft_reference_text, NULL,
           'SUBMITTED', 1, ?5, ?6, ?6
         FROM customer_sessions cs
         JOIN config cfg ON cfg.config_id = 'active'
@@ -22656,6 +22787,7 @@ var depositRepository = {
           AND cs.wizard_state = 'DEP_AWAITING_CONFIRM'
           AND cs.draft_token = ?7
           AND cs.expires_at > ?6
+          AND (cs.target_ticket_id IS NULL OR cs.target_ticket_id = ?3)
           AND cs.draft_amount >= cfg.min_deposit_amount
           AND cs.draft_amount <= cfg.max_deposit_amount
           AND EXISTS (
@@ -22665,6 +22797,12 @@ var depositRepository = {
           )
           AND EXISTS (
             SELECT 1 FROM customers WHERE telegram_user_id = ?2 AND account_status = 'ACTIVE'
+          )
+          AND EXISTS (
+            SELECT 1 FROM support_tickets st
+            WHERE st.ticket_id = ?3
+              AND st.customer_id = ?2
+              AND st.status IN ('OPEN', 'ASSIGNED')
           )
         ON CONFLICT(idempotency_token) DO NOTHING
         RETURNING *`
@@ -22783,12 +22921,8 @@ var withdrawalRepository = {
           status, version, last_mutation_token, created_at, updated_at
         )
         SELECT
-          ?1, cs.draft_token,
-          COALESCE(
-            (SELECT ticket_id FROM support_tickets WHERE customer_id = ?2 AND status IN ('OPEN', 'ASSIGNED') LIMIT 1),
-            ?3
-          ),
-          ?2, cs.draft_amount, ?4, cs.draft_method_code,
+          ?1, cs.draft_token, ?3, ?2,
+          cs.draft_amount, ?4, cs.draft_method_code,
           cs.draft_dest_masked, cs.draft_dest_ciphertext, cs.draft_dest_iv, cs.key_version,
           'SUBMITTED', 1, ?5, ?6, ?6
         FROM customer_sessions cs
@@ -22798,6 +22932,7 @@ var withdrawalRepository = {
           AND cs.wizard_state = 'WD_AWAITING_CONFIRM'
           AND cs.draft_token = ?7
           AND cs.expires_at > ?6
+          AND (cs.target_ticket_id IS NULL OR cs.target_ticket_id = ?3)
           AND cs.draft_amount >= cfg.min_withdrawal_amount
           AND cs.draft_amount <= cfg.max_withdrawal_amount
           AND cs.draft_dest_ciphertext IS NOT NULL
@@ -22809,6 +22944,12 @@ var withdrawalRepository = {
           )
           AND EXISTS (
             SELECT 1 FROM customers WHERE telegram_user_id = ?2 AND account_status = 'ACTIVE'
+          )
+          AND EXISTS (
+            SELECT 1 FROM support_tickets st
+            WHERE st.ticket_id = ?3
+              AND st.customer_id = ?2
+              AND st.status IN ('OPEN', 'ASSIGNED')
           )
         ON CONFLICT(idempotency_token) DO NOTHING
         RETURNING *`
@@ -22972,6 +23113,11 @@ var auditRepository = {
   async buildInsertStatement(db, input2, gateCondition, explicitPrevHash) {
     const auditId = input2.auditId ?? generatePrefixedId("aud", input2.nowMs);
     const prevHash = explicitPrevHash ?? await this.getLatestHash(db);
+    const beforeJson = serializeCanonicalJson(input2.beforeState);
+    const afterJson = serializeCanonicalJson(input2.afterState);
+    const reason = input2.reason ?? null;
+    const sourceUpdateId = input2.sourceUpdateId ?? null;
+    const hashVersion = CURRENT_AUDIT_HASH_VERSION;
     const entryHash = await computeAuditEntryHash({
       prevHash,
       auditId,
@@ -22981,21 +23127,24 @@ var auditRepository = {
       resourceType: input2.resourceType,
       resourceId: input2.resourceId,
       result: input2.result,
+      beforeStateJson: beforeJson,
+      afterStateJson: afterJson,
+      reason,
+      sourceUpdateId,
       createdAt: input2.nowMs,
-      correlationId: input2.correlationId
+      correlationId: input2.correlationId,
+      hashVersion
     });
-    const beforeJson = input2.beforeState ? JSON.stringify(input2.beforeState) : null;
-    const afterJson = input2.afterState ? JSON.stringify(input2.afterState) : null;
     if (gateCondition) {
       return db.prepare(
         `INSERT INTO audit_logs (
             audit_id, actor_id, actor_role, action, resource_type, resource_id, result,
             before_state_json, after_state_json, reason, correlation_id, source_update_id,
-            prev_entry_hash, entry_hash, created_at
-          ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+            prev_entry_hash, entry_hash, hash_version, created_at
+          ) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
           WHERE EXISTS (
             SELECT 1 FROM ${gateCondition.table}
-            WHERE ${gateCondition.pkColumn} = ?16 AND last_mutation_token = ?17
+            WHERE ${gateCondition.pkColumn} = ?17 AND last_mutation_token = ?18
           )`
       ).bind(
         auditId,
@@ -23007,11 +23156,12 @@ var auditRepository = {
         input2.result,
         beforeJson,
         afterJson,
-        input2.reason ?? null,
+        reason,
         input2.correlationId,
-        input2.sourceUpdateId ?? null,
+        sourceUpdateId,
         prevHash,
         entryHash,
+        hashVersion,
         input2.nowMs,
         gateCondition.pkValue,
         gateCondition.mutationToken
@@ -23021,8 +23171,8 @@ var auditRepository = {
       `INSERT INTO audit_logs (
           audit_id, actor_id, actor_role, action, resource_type, resource_id, result,
           before_state_json, after_state_json, reason, correlation_id, source_update_id,
-          prev_entry_hash, entry_hash, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`
+          prev_entry_hash, entry_hash, hash_version, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)`
     ).bind(
       auditId,
       input2.actorId,
@@ -23033,11 +23183,12 @@ var auditRepository = {
       input2.result,
       beforeJson,
       afterJson,
-      input2.reason ?? null,
+      reason,
       input2.correlationId,
-      input2.sourceUpdateId ?? null,
+      sourceUpdateId,
       prevHash,
       entryHash,
+      hashVersion,
       input2.nowMs
     );
   },
@@ -23129,15 +23280,37 @@ var auditRepository = {
           reason: "CHECKPOINT_PREV_HASH_MISMATCH"
         };
       }
-      const computedCpHash = await computeAuditCheckpointHash({
-        prevCheckpointHash: cp.prev_checkpoint_hash,
-        checkpointId: cp.checkpoint_id,
-        anchorAuditId: cp.anchor_audit_id,
-        anchorEntryHash: cp.anchor_entry_hash,
-        anchorCreatedAt: cp.anchor_created_at,
-        purgedCount: cp.purged_count,
-        createdAt: cp.created_at
-      });
+      const cpHashVersion = cp.hash_version;
+      if (typeof cpHashVersion !== "number" || !Number.isInteger(cpHashVersion)) {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenCheckpointId: cp.checkpoint_id,
+          reason: "UNSUPPORTED_CHECKPOINT_HASH_VERSION"
+        };
+      }
+      let computedCpHash;
+      try {
+        computedCpHash = await computeAuditCheckpointHash({
+          prevCheckpointHash: cp.prev_checkpoint_hash,
+          checkpointId: cp.checkpoint_id,
+          anchorAuditId: cp.anchor_audit_id,
+          anchorEntryHash: cp.anchor_entry_hash,
+          anchorCreatedAt: cp.anchor_created_at,
+          purgedCount: cp.purged_count,
+          createdAt: cp.created_at,
+          hashVersion: cpHashVersion
+        });
+      } catch {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenCheckpointId: cp.checkpoint_id,
+          reason: "UNSUPPORTED_CHECKPOINT_HASH_VERSION"
+        };
+      }
       if (computedCpHash !== cp.checkpoint_hash) {
         return {
           valid: false,
@@ -23161,18 +23334,44 @@ var auditRepository = {
           reason: "AUDIT_PREV_HASH_MISMATCH"
         };
       }
-      const computed = await computeAuditEntryHash({
-        prevHash: row.prev_entry_hash,
-        auditId: row.audit_id,
-        actorId: row.actor_id,
-        actorRole: row.actor_role,
-        action: row.action,
-        resourceType: row.resource_type,
-        resourceId: row.resource_id,
-        result: row.result,
-        createdAt: row.created_at,
-        correlationId: row.correlation_id
-      });
+      const rowHashVersion = row.hash_version;
+      if (typeof rowHashVersion !== "number" || !Number.isInteger(rowHashVersion)) {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenAuditId: row.audit_id,
+          reason: "UNSUPPORTED_AUDIT_HASH_VERSION"
+        };
+      }
+      let computed;
+      try {
+        computed = await computeAuditEntryHash({
+          prevHash: row.prev_entry_hash,
+          auditId: row.audit_id,
+          actorId: row.actor_id,
+          actorRole: row.actor_role,
+          action: row.action,
+          resourceType: row.resource_type,
+          resourceId: row.resource_id,
+          result: row.result,
+          beforeStateJson: row.before_state_json,
+          afterStateJson: row.after_state_json,
+          reason: row.reason,
+          sourceUpdateId: row.source_update_id,
+          createdAt: row.created_at,
+          correlationId: row.correlation_id,
+          hashVersion: rowHashVersion
+        });
+      } catch {
+        return {
+          valid: false,
+          checkedCount: logRes.results.length,
+          checkpointCount: cpRes.results.length,
+          brokenAuditId: row.audit_id,
+          reason: "UNSUPPORTED_AUDIT_HASH_VERSION"
+        };
+      }
       if (computed !== row.entry_hash) {
         return {
           valid: false,
@@ -23214,18 +23413,32 @@ var auditRepository = {
       if (row.prev_entry_hash !== expectedPrev) {
         throw new DatabaseError(`AUDIT_RETENTION_ABORTED_BROKEN_CHAIN_AT_${row.audit_id}`);
       }
-      const computed = await computeAuditEntryHash({
-        prevHash: row.prev_entry_hash,
-        auditId: row.audit_id,
-        actorId: row.actor_id,
-        actorRole: row.actor_role,
-        action: row.action,
-        resourceType: row.resource_type,
-        resourceId: row.resource_id,
-        result: row.result,
-        createdAt: row.created_at,
-        correlationId: row.correlation_id
-      });
+      const rowHashVersion = row.hash_version;
+      if (typeof rowHashVersion !== "number" || !Number.isInteger(rowHashVersion)) {
+        throw new DatabaseError(`AUDIT_RETENTION_ABORTED_UNSUPPORTED_HASH_VERSION_AT_${row.audit_id}`);
+      }
+      let computed;
+      try {
+        computed = await computeAuditEntryHash({
+          prevHash: row.prev_entry_hash,
+          auditId: row.audit_id,
+          actorId: row.actor_id,
+          actorRole: row.actor_role,
+          action: row.action,
+          resourceType: row.resource_type,
+          resourceId: row.resource_id,
+          result: row.result,
+          beforeStateJson: row.before_state_json,
+          afterStateJson: row.after_state_json,
+          reason: row.reason,
+          sourceUpdateId: row.source_update_id,
+          createdAt: row.created_at,
+          correlationId: row.correlation_id,
+          hashVersion: rowHashVersion
+        });
+      } catch {
+        throw new DatabaseError(`AUDIT_RETENTION_ABORTED_UNSUPPORTED_HASH_VERSION_AT_${row.audit_id}`);
+      }
       if (computed !== row.entry_hash) {
         throw new DatabaseError(`AUDIT_RETENTION_ABORTED_TAMPERED_HASH_AT_${row.audit_id}`);
       }
@@ -23234,6 +23447,7 @@ var auditRepository = {
     const anchorRow = toPurge[toPurge.length - 1];
     const checkpointId = generatePrefixedId("acp", nowMs);
     const prevCheckpointHash = latestCheckpoint ? latestCheckpoint.checkpoint_hash : "GENESIS_CHECKPOINT";
+    const checkpointHashVersion = CURRENT_CHECKPOINT_HASH_VERSION;
     const checkpointHash = await computeAuditCheckpointHash({
       prevCheckpointHash,
       checkpointId,
@@ -23241,13 +23455,14 @@ var auditRepository = {
       anchorEntryHash: anchorRow.entry_hash,
       anchorCreatedAt: anchorRow.created_at,
       purgedCount: toPurge.length,
-      createdAt: nowMs
+      createdAt: nowMs,
+      hashVersion: checkpointHashVersion
     });
     const insertCheckpointStmt = db.prepare(
       `INSERT INTO audit_retention_checkpoints (
           checkpoint_id, prev_checkpoint_hash, anchor_audit_id, anchor_entry_hash,
-          anchor_created_at, purged_count, checkpoint_hash, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)`
+          anchor_created_at, purged_count, checkpoint_hash, hash_version, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`
     ).bind(
       checkpointId,
       prevCheckpointHash,
@@ -23256,6 +23471,7 @@ var auditRepository = {
       anchorRow.created_at,
       toPurge.length,
       checkpointHash,
+      checkpointHashVersion,
       nowMs
     );
     const deleteStmts = [];
@@ -24014,7 +24230,8 @@ var outboxRepository = {
              updated_at = ?3
          WHERE outbox_id = ?1
            AND status = 'CLAIMED'
-           AND lease_token = ?2`
+           AND lease_token = ?2
+           AND lease_expires_at > ?3`
     ).bind(outboxId, leaseToken, nowMs).run();
     return res.meta.changes === 1;
   },
@@ -24037,6 +24254,7 @@ var outboxRepository = {
            WHERE outbox_id = ?1
              AND status = 'SENDING'
              AND lease_token = ?2
+             AND lease_expires_at > ?4
            RETURNING outbox_id`
       ).bind(params.outbox.outbox_id, params.leaseToken, params.telegramMessageId, params.nowMs)
     ];
@@ -24105,7 +24323,8 @@ var outboxRepository = {
              updated_at = ?5
          WHERE outbox_id = ?1
            AND status = 'SENDING'
-           AND lease_token = ?2`
+           AND lease_token = ?2
+           AND lease_expires_at > ?5`
     ).bind(
       params.outbox.outbox_id,
       params.leaseToken,
@@ -24130,6 +24349,7 @@ var outboxRepository = {
                WHERE outbox_id = ?1
                  AND status = 'SENDING'
                  AND lease_token = ?2
+                 AND lease_expires_at > ?3
                RETURNING outbox_id`
       ).bind(params.outbox.outbox_id, params.leaseToken, params.nowMs, truncatedErr) : db.prepare(
         `UPDATE outbox
@@ -24178,6 +24398,7 @@ var outboxRepository = {
            WHERE outbox_id = ?1
              AND status = 'SENDING'
              AND lease_token = ?2
+             AND lease_expires_at > ?4
            RETURNING outbox_id`
       ).bind(params.outbox.outbox_id, params.leaseToken, truncatedErr, params.nowMs)
     ];
@@ -24261,6 +24482,24 @@ var outboxRepository = {
              updated_at = ?2
          WHERE outbox_id = ?1
            AND status = 'CLAIMED'
+           AND lease_expires_at <= ?2`
+    ).bind(outboxId, nowMs).run();
+    return res.meta.changes === 1;
+  },
+  async recoverExpiredSendingIdempotentRow(db, outboxId, nowMs) {
+    const res = await db.prepare(
+      `UPDATE outbox
+         SET status = 'RETRYABLE_FAILURE',
+             available_at = ?2,
+             next_dispatch_at = ?2,
+             lease_owner = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             last_error = 'RECOVERED_EXPIRED_SENDING_IDEMPOTENT',
+             updated_at = ?2
+         WHERE outbox_id = ?1
+           AND status = 'SENDING'
+           AND is_idempotent_method = 1
            AND lease_expires_at <= ?2`
     ).bind(outboxId, nowMs).run();
     return res.meta.changes === 1;
@@ -25379,7 +25618,7 @@ var AmountInputSchema = external_exports.string().transform((val, ctx) => {
 // src/worker/services/depositService.ts
 var WIZARD_TTL_MS = 15 * 60 * 1e3;
 var depositService = {
-  async startDepositWizard(env, customerId, nowMs = systemClock.now()) {
+  async startDepositWizard(env, customerId, nowMs = systemClock.now(), options) {
     const [customer, config2] = await Promise.all([
       customerRepository.getById(env.DB, customerId),
       configRepository.getActiveConfig(env.DB)
@@ -25389,6 +25628,26 @@ var depositService = {
     }
     if (customer.account_status === "BANNED") {
       throw new AuthorizationError("Customer account is suspended");
+    }
+    let boundTicketId = null;
+    if (options?.ticketId !== void 0 && options?.ticketId !== null) {
+      const explicitTicket = await ticketRepository.getById(env.DB, options.ticketId);
+      if (!explicitTicket) {
+        throw new NotFoundError(`Ticket ${options.ticketId} not found`);
+      }
+      if (explicitTicket.customer_id !== customerId) {
+        throw new AuthorizationError("Associated ticket does not belong to this customer");
+      }
+      if (explicitTicket.status !== "OPEN" && explicitTicket.status !== "ASSIGNED") {
+        throw new ConflictError(`Ticket ${options.ticketId} is ${explicitTicket.status} and cannot accept deposit requests`);
+      }
+      boundTicketId = explicitTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError("Multiple active tickets exist for customer; explicit ticketId is required");
+      }
+      boundTicketId = activeTickets.length === 1 ? activeTickets[0].ticket_id : null;
     }
     const draftToken = generatePrefixedId("dft", nowMs);
     await customerRepository.upsertSession(env.DB, {
@@ -25405,6 +25664,7 @@ var depositService = {
       key_version: Number(env.ENCRYPTION_KEY_VERSION ?? "1"),
       target_request_type: null,
       target_request_id: null,
+      target_ticket_id: boundTicketId,
       started_at: nowMs,
       expires_at: nowMs + WIZARD_TTL_MS,
       updated_at: nowMs
@@ -25413,7 +25673,7 @@ var depositService = {
     const promptText = customer.language_code === "en" ? `\u{1F4B0} <b>Deposit Request</b>
 Enter deposit amount in ${safeCurrency} (${config2.min_deposit_amount.toLocaleString()} - ${config2.max_deposit_amount.toLocaleString()}):` : `\u{1F4B0} <b>\u1004\u103D\u1031\u101E\u103D\u1004\u103A\u1038\u101B\u1014\u103A \u1010\u1031\u102C\u1004\u103A\u1038\u1006\u102D\u102F\u1019\u103E\u102F</b>
 \u101E\u103D\u1004\u103A\u1038\u101C\u102D\u102F\u101E\u1031\u102C \u1004\u103D\u1031\u1015\u1019\u102C\u100F (${safeCurrency}) \u1000\u102D\u102F \u1002\u100F\u1014\u103A\u1038\u1016\u103C\u1004\u1037\u103A \u101B\u102D\u102F\u1000\u103A\u1011\u100A\u1037\u103A\u1015\u102B (${config2.min_deposit_amount.toLocaleString()} - ${config2.max_deposit_amount.toLocaleString()}):`;
-    return { promptText, draftToken };
+    return { promptText, draftToken, ticketId: boundTicketId };
   },
   async handleAmountInput(env, customerId, rawText, nowMs = systemClock.now()) {
     const [customer, session, config2] = await Promise.all([
@@ -25533,56 +25793,103 @@ Reference: <code>${safeRef}</code>` : `\u{1F4CB} <b>\u1004\u103D\u1031\u101E\u10
       if (existingByToken.customer_id !== params.customerId) {
         throw new AuthorizationError("Deposit draft token does not belong to this customer");
       }
+      if (params.ticketId && existingByToken.ticket_id !== params.ticketId) {
+        throw new ConflictError("Explicit ticket ID does not match the ticket bound to this deposit request");
+      }
       return { deposit: existingByToken, createdNew: false };
     }
-    const [customer, config2, activeTicket] = await Promise.all([
+    const [customer, config2, session] = await Promise.all([
       customerRepository.getById(env.DB, params.customerId),
       configRepository.getActiveConfig(env.DB),
-      ticketRepository.findActiveByCustomer(env.DB, params.customerId)
+      customerRepository.getSession(env.DB, params.customerId)
     ]);
     if (!customer) throw new NotFoundError("Customer not found");
     if (customer.account_status === "BANNED") {
       throw new AuthorizationError("Customer account is suspended");
     }
+    if (!session || session.wizard_type !== "DEPOSIT" || session.wizard_state !== "DEP_AWAITING_CONFIRM" || session.draft_token !== params.draftToken || session.expires_at <= nowMs) {
+      throw new ConflictError("Deposit submission failed validation or session expired");
+    }
+    const explicitParamTicketId = params.ticketId ?? null;
+    const sessionTicketId = session.target_ticket_id ?? null;
+    if (explicitParamTicketId && sessionTicketId && explicitParamTicketId !== sessionTicketId) {
+      throw new ConflictError("Explicit ticket ID does not match the ticket bound to this deposit workflow");
+    }
+    const intendedTicketId = explicitParamTicketId ?? sessionTicketId;
     const depositId = generateCollisionResistantRequestRef("DEP", nowMs);
-    const fallbackTicketId = activeTicket ? activeTicket.ticket_id : generatePrefixedId("tkt", nowMs);
     const mutationToken = generateMutationToken(nowMs);
     const stmts = [];
-    if (!activeTicket) {
-      stmts.push(
-        ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
-          ticketId: fallbackTicketId,
-          customerId: params.customerId,
-          ticketType: "SLIP_DEPOSIT",
-          mutationToken,
-          nowMs
-        })
-      );
+    let resolvedTicketId;
+    if (intendedTicketId !== null) {
+      const targetTicket = await ticketRepository.getById(env.DB, intendedTicketId);
+      if (!targetTicket) {
+        throw new NotFoundError(`Associated ticket ${intendedTicketId} not found`);
+      }
+      if (targetTicket.customer_id !== params.customerId) {
+        throw new AuthorizationError("Associated ticket does not belong to this customer");
+      }
+      if (targetTicket.status !== "OPEN" && targetTicket.status !== "ASSIGNED") {
+        throw new ConflictError(
+          `Associated ticket ${intendedTicketId} is ${targetTicket.status} and cannot accept deposit requests`
+        );
+      }
+      resolvedTicketId = targetTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, params.customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError("Multiple active tickets exist for customer; explicit ticketId is required");
+      }
+      if (activeTickets.length === 1) {
+        resolvedTicketId = activeTickets[0].ticket_id;
+      } else {
+        resolvedTicketId = generatePrefixedId("tkt", nowMs);
+        stmts.push(
+          ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
+            ticketId: resolvedTicketId,
+            customerId: params.customerId,
+            ticketType: "SLIP_DEPOSIT",
+            mutationToken,
+            nowMs
+          })
+        );
+      }
     }
     stmts.push(
       depositRepository.prepareAtomicCreateFromSession(env.DB, {
         depositId,
         customerId: params.customerId,
         draftToken: params.draftToken,
-        ticketId: fallbackTicketId,
+        ticketId: resolvedTicketId,
         currency: config2.currency,
         mutationToken,
         nowMs
-      })
+      }),
+      env.DB.prepare(
+        `DELETE FROM customer_sessions
+           WHERE customer_id = ?1
+             AND draft_token = ?2
+             AND EXISTS (
+               SELECT 1 FROM deposit_requests
+               WHERE idempotency_token = ?2
+                 AND last_mutation_token = ?3
+             )`
+      ).bind(params.customerId, params.draftToken, mutationToken)
     );
     const createResults = await executeAtomicBatch(env.DB, stmts);
-    const createdDeposit = createResults[createResults.length - 1]?.results?.[0] ?? null;
+    const createdDeposit = createResults[createResults.length - 2]?.results?.[0] ?? null;
     if (!createdDeposit) {
       const retryLookup = await env.DB.prepare("SELECT * FROM deposit_requests WHERE idempotency_token = ?1").bind(params.draftToken).first();
       if (retryLookup) {
         if (retryLookup.customer_id !== params.customerId) {
           throw new AuthorizationError("Deposit draft token does not belong to this customer");
         }
+        if (params.ticketId && retryLookup.ticket_id !== params.ticketId) {
+          throw new ConflictError("Explicit ticket ID does not match the ticket bound to this deposit request");
+        }
         return { deposit: retryLookup, createdNew: false };
       }
-      throw new ConflictError("Deposit submission failed validation or session expired");
+      throw new ConflictError("Deposit submission failed validation, ticket check, or session expired");
     }
-    await customerRepository.clearSession(env.DB, params.customerId);
     const ticketRow = await ticketRepository.getById(env.DB, createdDeposit.ticket_id);
     const ackText = customer.language_code === "en" ? `${STANDARD_REQUEST_ACK_EN}
 
@@ -26067,7 +26374,7 @@ Note: ${safeNote}` : `\u2753 <b>\u1004\u103D\u1031\u101E\u103D\u1004\u103A\u1038
 // src/worker/services/withdrawalService.ts
 var WIZARD_TTL_MS2 = 15 * 60 * 1e3;
 var withdrawalService = {
-  async startWithdrawalWizard(env, customerId, nowMs = systemClock.now()) {
+  async startWithdrawalWizard(env, customerId, nowMs = systemClock.now(), options) {
     const [customer, config2] = await Promise.all([
       customerRepository.getById(env.DB, customerId),
       configRepository.getActiveConfig(env.DB)
@@ -26075,6 +26382,26 @@ var withdrawalService = {
     if (!customer) throw new NotFoundError("Customer not found");
     if (customer.account_status === "BANNED") {
       throw new AuthorizationError("Customer account is suspended");
+    }
+    let boundTicketId = null;
+    if (options?.ticketId !== void 0 && options?.ticketId !== null) {
+      const explicitTicket = await ticketRepository.getById(env.DB, options.ticketId);
+      if (!explicitTicket) {
+        throw new NotFoundError(`Ticket ${options.ticketId} not found`);
+      }
+      if (explicitTicket.customer_id !== customerId) {
+        throw new AuthorizationError("Associated ticket does not belong to this customer");
+      }
+      if (explicitTicket.status !== "OPEN" && explicitTicket.status !== "ASSIGNED") {
+        throw new ConflictError(`Ticket ${options.ticketId} is ${explicitTicket.status} and cannot accept withdrawal requests`);
+      }
+      boundTicketId = explicitTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError("Multiple active tickets exist for customer; explicit ticketId is required");
+      }
+      boundTicketId = activeTickets.length === 1 ? activeTickets[0].ticket_id : null;
     }
     const draftToken = generatePrefixedId("wdt", nowMs);
     const keyVersion = Number(env.ENCRYPTION_KEY_VERSION ?? "1");
@@ -26092,6 +26419,7 @@ var withdrawalService = {
       key_version: keyVersion,
       target_request_type: null,
       target_request_id: null,
+      target_ticket_id: boundTicketId,
       started_at: nowMs,
       expires_at: nowMs + WIZARD_TTL_MS2,
       updated_at: nowMs
@@ -26102,7 +26430,7 @@ Enter withdrawal amount in ${safeCurrency} (${config2.min_withdrawal_amount.toLo
 ${ANTI_PHISHING_WARNING_EN}` : `\u{1F4B8} <b>\u1004\u103D\u1031\u1011\u102F\u1010\u103A\u101B\u1014\u103A \u1010\u1031\u102C\u1004\u103A\u1038\u1006\u102D\u102F\u1019\u103E\u102F</b>
 \u1011\u102F\u1010\u103A\u101A\u1030\u101C\u102D\u102F\u101E\u1031\u102C \u1004\u103D\u1031\u1015\u1019\u102C\u100F (${safeCurrency}) \u1000\u102D\u102F \u1002\u100F\u1014\u103A\u1038\u1016\u103C\u1004\u1037\u103A \u101B\u102D\u102F\u1000\u103A\u1011\u100A\u1037\u103A\u1015\u102B (${config2.min_withdrawal_amount.toLocaleString()} - ${config2.max_withdrawal_amount.toLocaleString()}):
 ${ANTI_PHISHING_WARNING_MY}`;
-    return { promptText, draftToken };
+    return { promptText, draftToken, ticketId: boundTicketId };
   },
   async handleAmountInput(env, customerId, rawText, nowMs = systemClock.now()) {
     const [customer, session, config2] = await Promise.all([
@@ -26234,56 +26562,103 @@ Destination: <code>${safeMasked}</code>` : `\u{1F4CB} <b>\u1004\u103D\u1031\u101
       if (existingByToken.customer_id !== params.customerId) {
         throw new AuthorizationError("Withdrawal draft token does not belong to this customer");
       }
+      if (params.ticketId && existingByToken.ticket_id !== params.ticketId) {
+        throw new ConflictError("Explicit ticket ID does not match the ticket bound to this withdrawal request");
+      }
       return { withdrawal: existingByToken, createdNew: false };
     }
-    const [customer, config2, activeTicket] = await Promise.all([
+    const [customer, config2, session] = await Promise.all([
       customerRepository.getById(env.DB, params.customerId),
       configRepository.getActiveConfig(env.DB),
-      ticketRepository.findActiveByCustomer(env.DB, params.customerId)
+      customerRepository.getSession(env.DB, params.customerId)
     ]);
     if (!customer) throw new NotFoundError("Customer not found");
     if (customer.account_status === "BANNED") {
       throw new AuthorizationError("Customer account is suspended");
     }
+    if (!session || session.wizard_type !== "WITHDRAWAL" || session.wizard_state !== "WD_AWAITING_CONFIRM" || session.draft_token !== params.draftToken || session.expires_at <= nowMs) {
+      throw new ConflictError("Withdrawal submission failed validation or session expired");
+    }
+    const explicitParamTicketId = params.ticketId ?? null;
+    const sessionTicketId = session.target_ticket_id ?? null;
+    if (explicitParamTicketId && sessionTicketId && explicitParamTicketId !== sessionTicketId) {
+      throw new ConflictError("Explicit ticket ID does not match the ticket bound to this withdrawal workflow");
+    }
+    const intendedTicketId = explicitParamTicketId ?? sessionTicketId;
     const withdrawalId = generateCollisionResistantRequestRef("WD", nowMs);
-    const fallbackTicketId = activeTicket ? activeTicket.ticket_id : generatePrefixedId("tkt", nowMs);
     const mutationToken = generateMutationToken(nowMs);
     const stmts = [];
-    if (!activeTicket) {
-      stmts.push(
-        ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
-          ticketId: fallbackTicketId,
-          customerId: params.customerId,
-          ticketType: "WITHDRAWAL",
-          mutationToken,
-          nowMs
-        })
-      );
+    let resolvedTicketId;
+    if (intendedTicketId !== null) {
+      const targetTicket = await ticketRepository.getById(env.DB, intendedTicketId);
+      if (!targetTicket) {
+        throw new NotFoundError(`Associated ticket ${intendedTicketId} not found`);
+      }
+      if (targetTicket.customer_id !== params.customerId) {
+        throw new AuthorizationError("Associated ticket does not belong to this customer");
+      }
+      if (targetTicket.status !== "OPEN" && targetTicket.status !== "ASSIGNED") {
+        throw new ConflictError(
+          `Associated ticket ${intendedTicketId} is ${targetTicket.status} and cannot accept withdrawal requests`
+        );
+      }
+      resolvedTicketId = targetTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, params.customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError("Multiple active tickets exist for customer; explicit ticketId is required");
+      }
+      if (activeTickets.length === 1) {
+        resolvedTicketId = activeTickets[0].ticket_id;
+      } else {
+        resolvedTicketId = generatePrefixedId("tkt", nowMs);
+        stmts.push(
+          ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
+            ticketId: resolvedTicketId,
+            customerId: params.customerId,
+            ticketType: "WITHDRAWAL",
+            mutationToken,
+            nowMs
+          })
+        );
+      }
     }
     stmts.push(
       withdrawalRepository.prepareAtomicCreateFromSession(env.DB, {
         withdrawalId,
         customerId: params.customerId,
         draftToken: params.draftToken,
-        ticketId: fallbackTicketId,
+        ticketId: resolvedTicketId,
         currency: config2.currency,
         mutationToken,
         nowMs
-      })
+      }),
+      env.DB.prepare(
+        `DELETE FROM customer_sessions
+           WHERE customer_id = ?1
+             AND draft_token = ?2
+             AND EXISTS (
+               SELECT 1 FROM withdrawal_requests
+               WHERE idempotency_token = ?2
+                 AND last_mutation_token = ?3
+             )`
+      ).bind(params.customerId, params.draftToken, mutationToken)
     );
     const createResults = await executeAtomicBatch(env.DB, stmts);
-    const createdWd = createResults[createResults.length - 1]?.results?.[0] ?? null;
+    const createdWd = createResults[createResults.length - 2]?.results?.[0] ?? null;
     if (!createdWd) {
       const retryLookup = await env.DB.prepare("SELECT * FROM withdrawal_requests WHERE idempotency_token = ?1").bind(params.draftToken).first();
       if (retryLookup) {
         if (retryLookup.customer_id !== params.customerId) {
           throw new AuthorizationError("Withdrawal draft token does not belong to this customer");
         }
+        if (params.ticketId && retryLookup.ticket_id !== params.ticketId) {
+          throw new ConflictError("Explicit ticket ID does not match the ticket bound to this withdrawal request");
+        }
         return { withdrawal: retryLookup, createdNew: false };
       }
-      throw new ConflictError("Withdrawal submission failed validation or session expired");
+      throw new ConflictError("Withdrawal submission failed validation, ticket check, or session expired");
     }
-    await customerRepository.clearSession(env.DB, params.customerId);
     const ticketRow = await ticketRepository.getById(env.DB, createdWd.ticket_id);
     const ackText = customer.language_code === "en" ? `${STANDARD_REQUEST_ACK_EN}
 
@@ -28984,31 +29359,72 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
     }
     return { processedCount };
   },
-  async processSingleOutbox(env, outboxId, correlationId = generatePrefixedId("cor"), queueEventId, nowMs = systemClock.now()) {
+  async processSingleOutbox(env, outboxId, correlationId = generatePrefixedId("cor"), queueEventId, nowMs, clock) {
+    const getNow = clock ?? (nowMs !== void 0 ? () => nowMs : () => systemClock.now());
+    const startNow = getNow();
     const existing = await outboxRepository.getById(env.DB, outboxId);
     if (!existing) return { outcome: "SKIPPED" };
     if (existing.status === "SENT" || existing.status === "PERMANENT_FAILURE" || existing.status === "DELIVERY_UNCERTAIN") {
       return { outcome: "SKIPPED" };
     }
-    const leaseOwner = queueEventId ?? generatePrefixedId("con", nowMs);
-    const leaseToken = generateLeaseToken(nowMs);
-    const acquiredEvent = await acquireQueueEventGuard(env, queueEventId, outboxId, leaseToken, nowMs);
+    const leaseOwner = queueEventId ?? generatePrefixedId("con", startNow);
+    const leaseToken = generateLeaseToken(startNow);
+    const acquiredEvent = await acquireQueueEventGuard(env, queueEventId, outboxId, leaseToken, startNow);
     if (!acquiredEvent) {
       return { outcome: "SKIPPED" };
+    }
+    if (existing.status === "SENDING" && existing.lease_expires_at !== null && existing.lease_expires_at <= startNow) {
+      if (existing.is_idempotent_method === 0) {
+        const fenced = await outboxRepository.markDeliveryUncertain(env.DB, {
+          outbox: existing,
+          errorMsg: "SENDING lease expired on consumer reclaim; fenced to DELIVERY_UNCERTAIN without duplicate Telegram send",
+          nowMs: startNow
+        });
+        if (fenced) {
+          await auditRepository.appendImmediate(env.DB, {
+            actorId: leaseOwner,
+            actorRole: "SYSTEM",
+            action: "EXPIRED_SENDING_LEASE_MARKED_DELIVERY_UNCERTAIN",
+            resourceType: "OUTBOX",
+            resourceId: outboxId,
+            result: "FAILURE",
+            beforeState: {
+              status: existing.status,
+              leaseOwner: existing.lease_owner,
+              leaseExpiresAt: existing.lease_expires_at,
+              attemptCount: existing.attempt_count
+            },
+            afterState: {
+              status: "DELIVERY_UNCERTAIN",
+              telegramMethod: existing.telegram_method,
+              fencedByConsumer: leaseOwner
+            },
+            reason: "Expired non-idempotent SENDING lease fenced on queue reclaim",
+            correlationId,
+            nowMs: startNow
+          });
+        }
+        await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", startNow);
+        return { outcome: fenced ? "DELIVERY_UNCERTAIN" : "SKIPPED" };
+      }
+      await outboxRepository.recoverExpiredSendingIdempotentRow(env.DB, outboxId, startNow);
+    } else if (existing.status === "CLAIMED" && existing.lease_expires_at !== null && existing.lease_expires_at <= startNow) {
+      await outboxRepository.recoverExpiredClaimedRow(env.DB, outboxId, startNow);
     }
     const claimed = await outboxRepository.claimForConsumer(env.DB, {
       outboxId,
       leaseOwner,
       leaseToken,
-      nowMs
+      nowMs: startNow
     });
     if (!claimed) {
-      await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", nowMs);
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", startNow);
       return { outcome: "SKIPPED" };
     }
-    const markedSending = await outboxRepository.markSending(env.DB, outboxId, leaseToken, nowMs);
+    const sendingNow = getNow();
+    const markedSending = await outboxRepository.markSending(env.DB, outboxId, leaseToken, sendingNow);
     if (!markedSending) {
-      await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", nowMs);
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", sendingNow);
       return { outcome: "SKIPPED" };
     }
     const payload = JSON.parse(claimed.payload_json);
@@ -29018,7 +29434,7 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
         claimed.telegram_method,
         payload
       );
-      const sentNow = systemClock.now();
+      const sentNow = getNow();
       const markedSent = await outboxRepository.markSent(env.DB, {
         outbox: claimed,
         leaseToken,
@@ -29026,11 +29442,33 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
         nowMs: sentNow
       });
       if (!markedSent) {
+        const currentRow = await outboxRepository.getById(env.DB, outboxId);
         logger.log({
           level: "WARN",
           event: "OUTBOX_LEASE_LOST_AFTER_TELEGRAM_SEND",
           correlationId,
-          outboxId
+          outboxId,
+          metadata: {
+            telegramMessageId: apiRes.messageId,
+            currentOutboxStatus: currentRow?.status ?? "UNKNOWN"
+          }
+        });
+        await auditRepository.appendImmediate(env.DB, {
+          actorId: leaseOwner,
+          actorRole: "SYSTEM",
+          action: "OUTBOX_LATE_TELEGRAM_SUCCESS_AFTER_LEASE_LOSS",
+          resourceType: "OUTBOX",
+          resourceId: outboxId,
+          result: "CONFLICT",
+          afterState: {
+            telegramMessageId: apiRes.messageId,
+            telegramMethod: claimed.telegram_method,
+            staleLeaseOwner: leaseOwner,
+            currentOutboxStatus: currentRow?.status ?? "UNKNOWN"
+          },
+          reason: "Telegram API returned 200 OK after worker lease expired or was fenced; outbox and message state left untouched for reconciliation",
+          correlationId,
+          nowMs: sentNow
         });
         await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", sentNow);
         return { outcome: "SKIPPED" };
@@ -29038,10 +29476,10 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
       await finalizeQueueEventGuard(env, queueEventId, leaseToken, "COMPLETED", sentNow);
       return { outcome: "SENT" };
     } catch (err) {
-      const errNow = systemClock.now();
+      const errNow = getNow();
       if (err instanceof RateLimitError) {
         const delayMs = Math.max(err.retryAfterSeconds, 5) * 1e3;
-        await outboxRepository.markRetryableFailure(env.DB, {
+        const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
           outbox: claimed,
           leaseToken,
           nextAvailableAt: errNow + delayMs,
@@ -29049,7 +29487,7 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
           nowMs: errNow
         });
         await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", errNow);
-        return { outcome: "RETRYABLE_FAILURE" };
+        return { outcome: markedRetry ? "RETRYABLE_FAILURE" : "SKIPPED" };
       }
       if (err instanceof ExternalServiceError) {
         if (err.isUncertainDelivery && claimed.is_idempotent_method === 0) {
@@ -29073,11 +29511,11 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
             });
           }
           await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", errNow);
-          return { outcome: "DELIVERY_UNCERTAIN" };
+          return { outcome: markedUncertain ? "DELIVERY_UNCERTAIN" : "SKIPPED" };
         }
         if (err.retryable) {
           const backoffMs = Math.min(3e5, Math.pow(2, claimed.attempt_count) * 5e3);
-          await outboxRepository.markRetryableFailure(env.DB, {
+          const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
             outbox: claimed,
             leaseToken,
             nextAvailableAt: errNow + backoffMs,
@@ -29085,7 +29523,7 @@ Manual operator inspection required. Auto-replay is disabled for safety.`,
             nowMs: errNow
           });
           await finalizeQueueEventGuard(env, queueEventId, leaseToken, "ABORTED", errNow);
-          return { outcome: "RETRYABLE_FAILURE" };
+          return { outcome: markedRetry ? "RETRYABLE_FAILURE" : "SKIPPED" };
         }
       }
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -29185,13 +29623,12 @@ var scheduledDispatcher = {
         if (ok) expiredClaimedRecovered++;
       } else if (row.status === "SENDING") {
         if (row.is_idempotent_method === 1) {
-          const res = await env.DB.prepare(
-            `UPDATE outbox
-               SET status = 'RETRYABLE_FAILURE', available_at = ?2, next_dispatch_at = ?2,
-                   lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL, updated_at = ?2
-               WHERE outbox_id = ?1 AND status = 'SENDING' AND lease_expires_at <= ?2`
-          ).bind(row.outbox_id, nowMs).run();
-          if (res.meta.changes === 1) {
+          const recovered = await outboxRepository.recoverExpiredSendingIdempotentRow(
+            env.DB,
+            row.outbox_id,
+            nowMs
+          );
+          if (recovered) {
             expiredClaimedRecovered++;
           }
         } else {

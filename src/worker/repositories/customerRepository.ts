@@ -128,6 +128,8 @@ export const customerRepository = {
     session: Omit<CustomerSessionRow, 'wizard_version'> & { expectedVersion?: number }
   ): Promise<boolean> {
     assertValidCustomerId(session.customer_id);
+    const targetTicketId = session.target_ticket_id ?? null;
+
     if (session.expectedVersion !== undefined) {
       const res = await db
         .prepare(
@@ -144,11 +146,12 @@ export const customerRepository = {
                key_version = ?11,
                target_request_type = ?12,
                target_request_id = ?13,
+               target_ticket_id = ?14,
                wizard_version = wizard_version + 1,
-               updated_at = ?14
+               updated_at = ?15
            WHERE customer_id = ?1
-             AND wizard_version = ?15
-             AND expires_at > ?14`
+             AND wizard_version = ?16
+             AND expires_at > ?15`
         )
         .bind(
           session.customer_id,
@@ -164,6 +167,7 @@ export const customerRepository = {
           session.key_version,
           session.target_request_type,
           session.target_request_id,
+          targetTicketId,
           session.updated_at,
           session.expectedVersion
         )
@@ -177,9 +181,9 @@ export const customerRepository = {
           customer_id, wizard_type, wizard_state, draft_token,
           draft_amount, draft_method_code, draft_reference_text,
           draft_dest_masked, draft_dest_ciphertext, draft_dest_iv,
-          key_version, target_request_type, target_request_id,
+          key_version, target_request_type, target_request_id, target_ticket_id,
           wizard_version, started_at, expires_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 1, ?14, ?15, ?16)
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 1, ?15, ?16, ?17)
         ON CONFLICT(customer_id) DO UPDATE SET
           wizard_type = excluded.wizard_type,
           wizard_state = excluded.wizard_state,
@@ -193,6 +197,7 @@ export const customerRepository = {
           key_version = excluded.key_version,
           target_request_type = excluded.target_request_type,
           target_request_id = excluded.target_request_id,
+          target_ticket_id = excluded.target_ticket_id,
           wizard_version = customer_sessions.wizard_version + 1,
           started_at = excluded.started_at,
           expires_at = excluded.expires_at,
@@ -212,6 +217,7 @@ export const customerRepository = {
         session.key_version,
         session.target_request_type,
         session.target_request_id,
+        targetTicketId,
         session.started_at,
         session.expires_at,
         session.updated_at

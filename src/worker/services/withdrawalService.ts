@@ -31,9 +31,15 @@ import { AuthorizationError, ConflictError, NotFoundError, ValidationError } fro
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 
 export const withdrawalService = {
-  async startWithdrawalWizard(env: Env, customerId: string, nowMs = systemClock.now()): Promise<{
+  async startWithdrawalWizard(
+    env: Env,
+    customerId: string,
+    nowMs = systemClock.now(),
+    options?: { ticketId?: string | null }
+  ): Promise<{
     promptText: string;
     draftToken: string;
+    ticketId: string | null;
   }> {
     const [customer, config] = await Promise.all([
       customerRepository.getById(env.DB, customerId),
@@ -42,6 +48,27 @@ export const withdrawalService = {
     if (!customer) throw new NotFoundError('Customer not found');
     if (customer.account_status === 'BANNED') {
       throw new AuthorizationError('Customer account is suspended');
+    }
+
+    let boundTicketId: string | null = null;
+    if (options?.ticketId !== undefined && options?.ticketId !== null) {
+      const explicitTicket = await ticketRepository.getById(env.DB, options.ticketId);
+      if (!explicitTicket) {
+        throw new NotFoundError(`Ticket ${options.ticketId} not found`);
+      }
+      if (explicitTicket.customer_id !== customerId) {
+        throw new AuthorizationError('Associated ticket does not belong to this customer');
+      }
+      if (explicitTicket.status !== 'OPEN' && explicitTicket.status !== 'ASSIGNED') {
+        throw new ConflictError(`Ticket ${options.ticketId} is ${explicitTicket.status} and cannot accept withdrawal requests`);
+      }
+      boundTicketId = explicitTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError('Multiple active tickets exist for customer; explicit ticketId is required');
+      }
+      boundTicketId = activeTickets.length === 1 ? activeTickets[0].ticket_id : null;
     }
 
     const draftToken = generatePrefixedId('wdt', nowMs);
@@ -61,6 +88,7 @@ export const withdrawalService = {
       key_version: keyVersion,
       target_request_type: null,
       target_request_id: null,
+      target_ticket_id: boundTicketId,
       started_at: nowMs,
       expires_at: nowMs + WIZARD_TTL_MS,
       updated_at: nowMs,
@@ -72,7 +100,7 @@ export const withdrawalService = {
         ? `💸 <b>Withdrawal Request</b>\nEnter withdrawal amount in ${safeCurrency} (${config.min_withdrawal_amount.toLocaleString()} - ${config.max_withdrawal_amount.toLocaleString()}):\n${ANTI_PHISHING_WARNING_EN}`
         : `💸 <b>ငွေထုတ်ရန် တောင်းဆိုမှု</b>\nထုတ်ယူလိုသော ငွေပမာဏ (${safeCurrency}) ကို ဂဏန်းဖြင့် ရိုက်ထည့်ပါ (${config.min_withdrawal_amount.toLocaleString()} - ${config.max_withdrawal_amount.toLocaleString()}):\n${ANTI_PHISHING_WARNING_MY}`;
 
-    return { promptText, draftToken };
+    return { promptText, draftToken, ticketId: boundTicketId };
   },
 
   async handleAmountInput(
@@ -232,6 +260,7 @@ export const withdrawalService = {
     params: {
       customerId: string;
       draftToken: string;
+      ticketId?: string | null;
       correlationId: string;
       sourceUpdateId?: number | null;
       nowMs?: number;
@@ -246,34 +275,77 @@ export const withdrawalService = {
       if (existingByToken.customer_id !== params.customerId) {
         throw new AuthorizationError('Withdrawal draft token does not belong to this customer');
       }
+      if (params.ticketId && existingByToken.ticket_id !== params.ticketId) {
+        throw new ConflictError('Explicit ticket ID does not match the ticket bound to this withdrawal request');
+      }
       return { withdrawal: existingByToken, createdNew: false };
     }
 
-    const [customer, config, activeTicket] = await Promise.all([
+    const [customer, config, session] = await Promise.all([
       customerRepository.getById(env.DB, params.customerId),
       configRepository.getActiveConfig(env.DB),
-      ticketRepository.findActiveByCustomer(env.DB, params.customerId),
+      customerRepository.getSession(env.DB, params.customerId),
     ]);
     if (!customer) throw new NotFoundError('Customer not found');
     if (customer.account_status === 'BANNED') {
       throw new AuthorizationError('Customer account is suspended');
     }
+    if (
+      !session ||
+      session.wizard_type !== 'WITHDRAWAL' ||
+      session.wizard_state !== 'WD_AWAITING_CONFIRM' ||
+      session.draft_token !== params.draftToken ||
+      session.expires_at <= nowMs
+    ) {
+      throw new ConflictError('Withdrawal submission failed validation or session expired');
+    }
 
+    const explicitParamTicketId = params.ticketId ?? null;
+    const sessionTicketId = session.target_ticket_id ?? null;
+    if (explicitParamTicketId && sessionTicketId && explicitParamTicketId !== sessionTicketId) {
+      throw new ConflictError('Explicit ticket ID does not match the ticket bound to this withdrawal workflow');
+    }
+
+    const intendedTicketId = explicitParamTicketId ?? sessionTicketId;
     const withdrawalId = generateCollisionResistantRequestRef('WD', nowMs);
-    const fallbackTicketId = activeTicket ? activeTicket.ticket_id : generatePrefixedId('tkt', nowMs);
     const mutationToken = generateMutationToken(nowMs);
 
     const stmts = [];
-    if (!activeTicket) {
-      stmts.push(
-        ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
-          ticketId: fallbackTicketId,
-          customerId: params.customerId,
-          ticketType: 'WITHDRAWAL',
-          mutationToken,
-          nowMs,
-        })
-      );
+    let resolvedTicketId: string;
+
+    if (intendedTicketId !== null) {
+      const targetTicket = await ticketRepository.getById(env.DB, intendedTicketId);
+      if (!targetTicket) {
+        throw new NotFoundError(`Associated ticket ${intendedTicketId} not found`);
+      }
+      if (targetTicket.customer_id !== params.customerId) {
+        throw new AuthorizationError('Associated ticket does not belong to this customer');
+      }
+      if (targetTicket.status !== 'OPEN' && targetTicket.status !== 'ASSIGNED') {
+        throw new ConflictError(
+          `Associated ticket ${intendedTicketId} is ${targetTicket.status} and cannot accept withdrawal requests`
+        );
+      }
+      resolvedTicketId = targetTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, params.customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError('Multiple active tickets exist for customer; explicit ticketId is required');
+      }
+      if (activeTickets.length === 1) {
+        resolvedTicketId = activeTickets[0].ticket_id;
+      } else {
+        resolvedTicketId = generatePrefixedId('tkt', nowMs);
+        stmts.push(
+          ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
+            ticketId: resolvedTicketId,
+            customerId: params.customerId,
+            ticketType: 'WITHDRAWAL',
+            mutationToken,
+            nowMs,
+          })
+        );
+      }
     }
 
     stmts.push(
@@ -281,16 +353,28 @@ export const withdrawalService = {
         withdrawalId,
         customerId: params.customerId,
         draftToken: params.draftToken,
-        ticketId: fallbackTicketId,
+        ticketId: resolvedTicketId,
         currency: config.currency,
         mutationToken,
         nowMs,
-      })
+      }),
+      env.DB
+        .prepare(
+          `DELETE FROM customer_sessions
+           WHERE customer_id = ?1
+             AND draft_token = ?2
+             AND EXISTS (
+               SELECT 1 FROM withdrawal_requests
+               WHERE idempotency_token = ?2
+                 AND last_mutation_token = ?3
+             )`
+        )
+        .bind(params.customerId, params.draftToken, mutationToken)
     );
 
     const createResults = await executeAtomicBatch(env.DB, stmts);
     const createdWd =
-      (createResults[createResults.length - 1]?.results?.[0] as unknown as WithdrawalRequestRow | undefined) ?? null;
+      (createResults[createResults.length - 2]?.results?.[0] as unknown as WithdrawalRequestRow | undefined) ?? null;
 
     if (!createdWd) {
       const retryLookup = await env.DB
@@ -301,12 +385,13 @@ export const withdrawalService = {
         if (retryLookup.customer_id !== params.customerId) {
           throw new AuthorizationError('Withdrawal draft token does not belong to this customer');
         }
+        if (params.ticketId && retryLookup.ticket_id !== params.ticketId) {
+          throw new ConflictError('Explicit ticket ID does not match the ticket bound to this withdrawal request');
+        }
         return { withdrawal: retryLookup, createdNew: false };
       }
-      throw new ConflictError('Withdrawal submission failed validation or session expired');
+      throw new ConflictError('Withdrawal submission failed validation, ticket check, or session expired');
     }
-
-    await customerRepository.clearSession(env.DB, params.customerId);
 
     const ticketRow = (await ticketRepository.getById(env.DB, createdWd.ticket_id))!;
     const ackText =

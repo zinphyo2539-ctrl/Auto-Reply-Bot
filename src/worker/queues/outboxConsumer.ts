@@ -231,10 +231,14 @@ export const outboxConsumer = {
     outboxId: string,
     correlationId = generatePrefixedId('cor'),
     queueEventId?: string,
-    nowMs = systemClock.now()
+    nowMs?: number,
+    clock?: () => number
   ): Promise<{
     outcome: 'SENT' | 'RETRYABLE_FAILURE' | 'DELIVERY_UNCERTAIN' | 'PERMANENT_FAILURE' | 'SKIPPED';
   }> {
+    const getNow = clock ?? (nowMs !== undefined ? () => nowMs : () => systemClock.now());
+    const startNow = getNow();
+
     const existing = await outboxRepository.getById(env.DB, outboxId);
     if (!existing) return { outcome: 'SKIPPED' };
 
@@ -247,13 +251,67 @@ export const outboxConsumer = {
       return { outcome: 'SKIPPED' };
     }
 
-    const leaseOwner = queueEventId ?? generatePrefixedId('con', nowMs);
-    const leaseToken = generateLeaseToken(nowMs);
+    const leaseOwner = queueEventId ?? generatePrefixedId('con', startNow);
+    const leaseToken = generateLeaseToken(startNow);
 
     // F-06C: Durable pre-claim deduplication via processed_queue_events
-    const acquiredEvent = await acquireQueueEventGuard(env, queueEventId, outboxId, leaseToken, nowMs);
+    const acquiredEvent = await acquireQueueEventGuard(env, queueEventId, outboxId, leaseToken, startNow);
     if (!acquiredEvent) {
       return { outcome: 'SKIPPED' };
+    }
+
+    // F-06: Fence expired in-flight leases on consumer reclaim BEFORE attempting any claim or Telegram send.
+    // Non-idempotent SENDING rows (sendMessage / sendPhoto) MUST transition to DELIVERY_UNCERTAIN so a
+    // reclaiming consumer can never trigger a duplicate Telegram message and the stale worker is fenced out.
+    if (
+      existing.status === 'SENDING' &&
+      existing.lease_expires_at !== null &&
+      existing.lease_expires_at <= startNow
+    ) {
+      if (existing.is_idempotent_method === 0) {
+        const fenced = await outboxRepository.markDeliveryUncertain(env.DB, {
+          outbox: existing,
+          errorMsg:
+            'SENDING lease expired on consumer reclaim; fenced to DELIVERY_UNCERTAIN without duplicate Telegram send',
+          nowMs: startNow,
+        });
+        if (fenced) {
+          await auditRepository.appendImmediate(env.DB, {
+            actorId: leaseOwner,
+            actorRole: 'SYSTEM',
+            action: 'EXPIRED_SENDING_LEASE_MARKED_DELIVERY_UNCERTAIN',
+            resourceType: 'OUTBOX',
+            resourceId: outboxId,
+            result: 'FAILURE',
+            beforeState: {
+              status: existing.status,
+              leaseOwner: existing.lease_owner,
+              leaseExpiresAt: existing.lease_expires_at,
+              attemptCount: existing.attempt_count,
+            },
+            afterState: {
+              status: 'DELIVERY_UNCERTAIN',
+              telegramMethod: existing.telegram_method,
+              fencedByConsumer: leaseOwner,
+            },
+            reason: 'Expired non-idempotent SENDING lease fenced on queue reclaim',
+            correlationId,
+            nowMs: startNow,
+          });
+        }
+        await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', startNow);
+        return { outcome: fenced ? 'DELIVERY_UNCERTAIN' : 'SKIPPED' };
+      }
+
+      // Idempotent editMessageText can safely be recovered to RETRYABLE_FAILURE and re-claimed
+      await outboxRepository.recoverExpiredSendingIdempotentRow(env.DB, outboxId, startNow);
+    } else if (
+      existing.status === 'CLAIMED' &&
+      existing.lease_expires_at !== null &&
+      existing.lease_expires_at <= startNow
+    ) {
+      // Pre-network CLAIMED crash can safely be recovered before claimForConsumer
+      await outboxRepository.recoverExpiredClaimedRow(env.DB, outboxId, startNow);
     }
 
     // Phase 1: PENDING | RETRYABLE_FAILURE -> CLAIMED (enforcing per-chat ordering)
@@ -261,17 +319,18 @@ export const outboxConsumer = {
       outboxId,
       leaseOwner,
       leaseToken,
-      nowMs,
+      nowMs: startNow,
     });
     if (!claimed) {
-      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', nowMs);
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', startNow);
       return { outcome: 'SKIPPED' };
     }
 
     // Phase 2: CLAIMED -> SENDING immediately prior to network dispatch
-    const markedSending = await outboxRepository.markSending(env.DB, outboxId, leaseToken, nowMs);
+    const sendingNow = getNow();
+    const markedSending = await outboxRepository.markSending(env.DB, outboxId, leaseToken, sendingNow);
     if (!markedSending) {
-      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', nowMs);
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', sendingNow);
       return { outcome: 'SKIPPED' };
     }
 
@@ -284,7 +343,7 @@ export const outboxConsumer = {
         payload
       );
 
-      const sentNow = systemClock.now();
+      const sentNow = getNow();
       const markedSent = await outboxRepository.markSent(env.DB, {
         outbox: claimed,
         leaseToken,
@@ -293,11 +352,34 @@ export const outboxConsumer = {
       });
 
       if (!markedSent) {
+        const currentRow = await outboxRepository.getById(env.DB, outboxId);
         logger.log({
           level: 'WARN',
           event: 'OUTBOX_LEASE_LOST_AFTER_TELEGRAM_SEND',
           correlationId,
           outboxId,
+          metadata: {
+            telegramMessageId: apiRes.messageId,
+            currentOutboxStatus: currentRow?.status ?? 'UNKNOWN',
+          },
+        });
+        await auditRepository.appendImmediate(env.DB, {
+          actorId: leaseOwner,
+          actorRole: 'SYSTEM',
+          action: 'OUTBOX_LATE_TELEGRAM_SUCCESS_AFTER_LEASE_LOSS',
+          resourceType: 'OUTBOX',
+          resourceId: outboxId,
+          result: 'CONFLICT',
+          afterState: {
+            telegramMessageId: apiRes.messageId,
+            telegramMethod: claimed.telegram_method,
+            staleLeaseOwner: leaseOwner,
+            currentOutboxStatus: currentRow?.status ?? 'UNKNOWN',
+          },
+          reason:
+            'Telegram API returned 200 OK after worker lease expired or was fenced; outbox and message state left untouched for reconciliation',
+          correlationId,
+          nowMs: sentNow,
         });
         await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', sentNow);
         return { outcome: 'SKIPPED' };
@@ -306,11 +388,11 @@ export const outboxConsumer = {
       await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'COMPLETED', sentNow);
       return { outcome: 'SENT' };
     } catch (err) {
-      const errNow = systemClock.now();
+      const errNow = getNow();
 
       if (err instanceof RateLimitError) {
         const delayMs = Math.max(err.retryAfterSeconds, 5) * 1000;
-        await outboxRepository.markRetryableFailure(env.DB, {
+        const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
           outbox: claimed,
           leaseToken,
           nextAvailableAt: errNow + delayMs,
@@ -318,7 +400,7 @@ export const outboxConsumer = {
           nowMs: errNow,
         });
         await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
-        return { outcome: 'RETRYABLE_FAILURE' };
+        return { outcome: markedRetry ? 'RETRYABLE_FAILURE' : 'SKIPPED' };
       }
 
       if (err instanceof ExternalServiceError) {
@@ -343,12 +425,12 @@ export const outboxConsumer = {
             });
           }
           await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
-          return { outcome: 'DELIVERY_UNCERTAIN' };
+          return { outcome: markedUncertain ? 'DELIVERY_UNCERTAIN' : 'SKIPPED' };
         }
 
         if (err.retryable) {
           const backoffMs = Math.min(300000, Math.pow(2, claimed.attempt_count) * 5000);
-          await outboxRepository.markRetryableFailure(env.DB, {
+          const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
             outbox: claimed,
             leaseToken,
             nextAvailableAt: errNow + backoffMs,
@@ -356,7 +438,7 @@ export const outboxConsumer = {
             nowMs: errNow,
           });
           await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
-          return { outcome: 'RETRYABLE_FAILURE' };
+          return { outcome: markedRetry ? 'RETRYABLE_FAILURE' : 'SKIPPED' };
         }
       }
 

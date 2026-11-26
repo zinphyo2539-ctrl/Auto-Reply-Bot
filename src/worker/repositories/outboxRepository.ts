@@ -211,7 +211,8 @@ export const outboxRepository = {
              updated_at = ?3
          WHERE outbox_id = ?1
            AND status = 'CLAIMED'
-           AND lease_token = ?2`
+           AND lease_token = ?2
+           AND lease_expires_at > ?3`
       )
       .bind(outboxId, leaseToken, nowMs)
       .run();
@@ -246,6 +247,7 @@ export const outboxRepository = {
            WHERE outbox_id = ?1
              AND status = 'SENDING'
              AND lease_token = ?2
+             AND lease_expires_at > ?4
            RETURNING outbox_id`
         )
         .bind(params.outbox.outbox_id, params.leaseToken, params.telegramMessageId, params.nowMs),
@@ -338,7 +340,8 @@ export const outboxRepository = {
              updated_at = ?5
          WHERE outbox_id = ?1
            AND status = 'SENDING'
-           AND lease_token = ?2`
+           AND lease_token = ?2
+           AND lease_expires_at > ?5`
       )
       .bind(
         params.outbox.outbox_id,
@@ -376,6 +379,7 @@ export const outboxRepository = {
                WHERE outbox_id = ?1
                  AND status = 'SENDING'
                  AND lease_token = ?2
+                 AND lease_expires_at > ?3
                RETURNING outbox_id`
             )
             .bind(params.outbox.outbox_id, params.leaseToken, params.nowMs, truncatedErr)
@@ -442,6 +446,7 @@ export const outboxRepository = {
            WHERE outbox_id = ?1
              AND status = 'SENDING'
              AND lease_token = ?2
+             AND lease_expires_at > ?4
            RETURNING outbox_id`
         )
         .bind(params.outbox.outbox_id, params.leaseToken, truncatedErr, params.nowMs),
@@ -548,6 +553,32 @@ export const outboxRepository = {
              updated_at = ?2
          WHERE outbox_id = ?1
            AND status = 'CLAIMED'
+           AND lease_expires_at <= ?2`
+      )
+      .bind(outboxId, nowMs)
+      .run();
+    return res.meta.changes === 1;
+  },
+
+  async recoverExpiredSendingIdempotentRow(
+    db: D1Database,
+    outboxId: string,
+    nowMs: number
+  ): Promise<boolean> {
+    const res = await db
+      .prepare(
+        `UPDATE outbox
+         SET status = 'RETRYABLE_FAILURE',
+             available_at = ?2,
+             next_dispatch_at = ?2,
+             lease_owner = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             last_error = 'RECOVERED_EXPIRED_SENDING_IDEMPOTENT',
+             updated_at = ?2
+         WHERE outbox_id = ?1
+           AND status = 'SENDING'
+           AND is_idempotent_method = 1
            AND lease_expires_at <= ?2`
       )
       .bind(outboxId, nowMs)

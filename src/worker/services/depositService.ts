@@ -28,9 +28,15 @@ import { AuthorizationError, ConflictError, NotFoundError, ValidationError } fro
 const WIZARD_TTL_MS = 15 * 60 * 1000;
 
 export const depositService = {
-  async startDepositWizard(env: Env, customerId: string, nowMs = systemClock.now()): Promise<{
+  async startDepositWizard(
+    env: Env,
+    customerId: string,
+    nowMs = systemClock.now(),
+    options?: { ticketId?: string | null }
+  ): Promise<{
     promptText: string;
     draftToken: string;
+    ticketId: string | null;
   }> {
     const [customer, config] = await Promise.all([
       customerRepository.getById(env.DB, customerId),
@@ -41,6 +47,27 @@ export const depositService = {
     }
     if (customer.account_status === 'BANNED') {
       throw new AuthorizationError('Customer account is suspended');
+    }
+
+    let boundTicketId: string | null = null;
+    if (options?.ticketId !== undefined && options?.ticketId !== null) {
+      const explicitTicket = await ticketRepository.getById(env.DB, options.ticketId);
+      if (!explicitTicket) {
+        throw new NotFoundError(`Ticket ${options.ticketId} not found`);
+      }
+      if (explicitTicket.customer_id !== customerId) {
+        throw new AuthorizationError('Associated ticket does not belong to this customer');
+      }
+      if (explicitTicket.status !== 'OPEN' && explicitTicket.status !== 'ASSIGNED') {
+        throw new ConflictError(`Ticket ${options.ticketId} is ${explicitTicket.status} and cannot accept deposit requests`);
+      }
+      boundTicketId = explicitTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError('Multiple active tickets exist for customer; explicit ticketId is required');
+      }
+      boundTicketId = activeTickets.length === 1 ? activeTickets[0].ticket_id : null;
     }
 
     const draftToken = generatePrefixedId('dft', nowMs);
@@ -58,6 +85,7 @@ export const depositService = {
       key_version: Number(env.ENCRYPTION_KEY_VERSION ?? '1'),
       target_request_type: null,
       target_request_id: null,
+      target_ticket_id: boundTicketId,
       started_at: nowMs,
       expires_at: nowMs + WIZARD_TTL_MS,
       updated_at: nowMs,
@@ -69,7 +97,7 @@ export const depositService = {
         ? `💰 <b>Deposit Request</b>\nEnter deposit amount in ${safeCurrency} (${config.min_deposit_amount.toLocaleString()} - ${config.max_deposit_amount.toLocaleString()}):`
         : `💰 <b>ငွေသွင်းရန် တောင်းဆိုမှု</b>\nသွင်းလိုသော ငွေပမာဏ (${safeCurrency}) ကို ဂဏန်းဖြင့် ရိုက်ထည့်ပါ (${config.min_deposit_amount.toLocaleString()} - ${config.max_deposit_amount.toLocaleString()}):`;
 
-    return { promptText, draftToken };
+    return { promptText, draftToken, ticketId: boundTicketId };
   },
 
   async handleAmountInput(
@@ -213,6 +241,7 @@ export const depositService = {
     params: {
       customerId: string;
       draftToken: string;
+      ticketId?: string | null;
       correlationId: string;
       sourceUpdateId?: number | null;
       nowMs?: number;
@@ -227,34 +256,77 @@ export const depositService = {
       if (existingByToken.customer_id !== params.customerId) {
         throw new AuthorizationError('Deposit draft token does not belong to this customer');
       }
+      if (params.ticketId && existingByToken.ticket_id !== params.ticketId) {
+        throw new ConflictError('Explicit ticket ID does not match the ticket bound to this deposit request');
+      }
       return { deposit: existingByToken, createdNew: false };
     }
 
-    const [customer, config, activeTicket] = await Promise.all([
+    const [customer, config, session] = await Promise.all([
       customerRepository.getById(env.DB, params.customerId),
       configRepository.getActiveConfig(env.DB),
-      ticketRepository.findActiveByCustomer(env.DB, params.customerId),
+      customerRepository.getSession(env.DB, params.customerId),
     ]);
     if (!customer) throw new NotFoundError('Customer not found');
     if (customer.account_status === 'BANNED') {
       throw new AuthorizationError('Customer account is suspended');
     }
+    if (
+      !session ||
+      session.wizard_type !== 'DEPOSIT' ||
+      session.wizard_state !== 'DEP_AWAITING_CONFIRM' ||
+      session.draft_token !== params.draftToken ||
+      session.expires_at <= nowMs
+    ) {
+      throw new ConflictError('Deposit submission failed validation or session expired');
+    }
 
+    const explicitParamTicketId = params.ticketId ?? null;
+    const sessionTicketId = session.target_ticket_id ?? null;
+    if (explicitParamTicketId && sessionTicketId && explicitParamTicketId !== sessionTicketId) {
+      throw new ConflictError('Explicit ticket ID does not match the ticket bound to this deposit workflow');
+    }
+
+    const intendedTicketId = explicitParamTicketId ?? sessionTicketId;
     const depositId = generateCollisionResistantRequestRef('DEP', nowMs);
-    const fallbackTicketId = activeTicket ? activeTicket.ticket_id : generatePrefixedId('tkt', nowMs);
     const mutationToken = generateMutationToken(nowMs);
 
     const stmts = [];
-    if (!activeTicket) {
-      stmts.push(
-        ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
-          ticketId: fallbackTicketId,
-          customerId: params.customerId,
-          ticketType: 'SLIP_DEPOSIT',
-          mutationToken,
-          nowMs,
-        })
-      );
+    let resolvedTicketId: string;
+
+    if (intendedTicketId !== null) {
+      const targetTicket = await ticketRepository.getById(env.DB, intendedTicketId);
+      if (!targetTicket) {
+        throw new NotFoundError(`Associated ticket ${intendedTicketId} not found`);
+      }
+      if (targetTicket.customer_id !== params.customerId) {
+        throw new AuthorizationError('Associated ticket does not belong to this customer');
+      }
+      if (targetTicket.status !== 'OPEN' && targetTicket.status !== 'ASSIGNED') {
+        throw new ConflictError(
+          `Associated ticket ${intendedTicketId} is ${targetTicket.status} and cannot accept deposit requests`
+        );
+      }
+      resolvedTicketId = targetTicket.ticket_id;
+    } else {
+      const activeTickets = await ticketRepository.listActiveByCustomer(env.DB, params.customerId, 2);
+      if (activeTickets.length > 1) {
+        throw new ConflictError('Multiple active tickets exist for customer; explicit ticketId is required');
+      }
+      if (activeTickets.length === 1) {
+        resolvedTicketId = activeTickets[0].ticket_id;
+      } else {
+        resolvedTicketId = generatePrefixedId('tkt', nowMs);
+        stmts.push(
+          ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
+            ticketId: resolvedTicketId,
+            customerId: params.customerId,
+            ticketType: 'SLIP_DEPOSIT',
+            mutationToken,
+            nowMs,
+          })
+        );
+      }
     }
 
     stmts.push(
@@ -262,16 +334,28 @@ export const depositService = {
         depositId,
         customerId: params.customerId,
         draftToken: params.draftToken,
-        ticketId: fallbackTicketId,
+        ticketId: resolvedTicketId,
         currency: config.currency,
         mutationToken,
         nowMs,
-      })
+      }),
+      env.DB
+        .prepare(
+          `DELETE FROM customer_sessions
+           WHERE customer_id = ?1
+             AND draft_token = ?2
+             AND EXISTS (
+               SELECT 1 FROM deposit_requests
+               WHERE idempotency_token = ?2
+                 AND last_mutation_token = ?3
+             )`
+        )
+        .bind(params.customerId, params.draftToken, mutationToken)
     );
 
     const createResults = await executeAtomicBatch(env.DB, stmts);
     const createdDeposit =
-      (createResults[createResults.length - 1]?.results?.[0] as unknown as DepositRequestRow | undefined) ?? null;
+      (createResults[createResults.length - 2]?.results?.[0] as unknown as DepositRequestRow | undefined) ?? null;
 
     if (!createdDeposit) {
       const retryLookup = await env.DB
@@ -282,12 +366,13 @@ export const depositService = {
         if (retryLookup.customer_id !== params.customerId) {
           throw new AuthorizationError('Deposit draft token does not belong to this customer');
         }
+        if (params.ticketId && retryLookup.ticket_id !== params.ticketId) {
+          throw new ConflictError('Explicit ticket ID does not match the ticket bound to this deposit request');
+        }
         return { deposit: retryLookup, createdNew: false };
       }
-      throw new ConflictError('Deposit submission failed validation or session expired');
+      throw new ConflictError('Deposit submission failed validation, ticket check, or session expired');
     }
-
-    await customerRepository.clearSession(env.DB, params.customerId);
 
     const ticketRow = (await ticketRepository.getById(env.DB, createdDeposit.ticket_id))!;
     const ackText =

@@ -14,10 +14,24 @@ export const ticketRepository = {
       .prepare(
         `SELECT * FROM support_tickets
          WHERE customer_id = ?1 AND status IN ('OPEN', 'ASSIGNED')
+         ORDER BY created_at DESC, ticket_id DESC
          LIMIT 1`
       )
       .bind(customerId)
       .first<SupportTicketRow>();
+  },
+
+  async listActiveByCustomer(db: D1Database, customerId: string, limit = 10): Promise<SupportTicketRow[]> {
+    const res = await db
+      .prepare(
+        `SELECT * FROM support_tickets
+         WHERE customer_id = ?1 AND status IN ('OPEN', 'ASSIGNED')
+         ORDER BY created_at DESC, ticket_id DESC
+         LIMIT ?2`
+      )
+      .bind(customerId, limit)
+      .all<SupportTicketRow>();
+    return res.results;
   },
 
   prepareCreateIfNoActiveTicket(

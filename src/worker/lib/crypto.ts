@@ -266,7 +266,122 @@ export async function decryptPayoutDestination(
   return decoder.decode(decryptedBuf);
 }
 
-export async function computeAuditEntryHash(params: {
+export const CURRENT_AUDIT_HASH_VERSION = 2;
+export const CURRENT_CHECKPOINT_HASH_VERSION = 2;
+
+export type CanonicalFieldType = 'N' | 'S' | 'I' | 'J' | 'R';
+
+export interface CanonicalField {
+  name: string;
+  type: CanonicalFieldType;
+  value: string;
+}
+
+/**
+ * Recursively canonicalizes JSON values by sorting plain-object keys lexicographically
+ * while preserving array element order and matching JSON.stringify undefined-omission semantics.
+ */
+export function canonicalizeJsonValue(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => (item === undefined ? null : canonicalizeJsonValue(item)));
+  }
+  const record = value as Record<string, unknown>;
+  const sorted: Record<string, unknown> = {};
+  for (const key of Object.keys(record).sort()) {
+    const val = record[key];
+    if (val !== undefined) {
+      sorted[key] = canonicalizeJsonValue(val);
+    }
+  }
+  return sorted;
+}
+
+/**
+ * Serializes an optional structured object into deterministic canonical JSON text (or null).
+ */
+export function serializeCanonicalJson(value: Record<string, unknown> | null | undefined): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  return JSON.stringify(canonicalizeJsonValue(value));
+}
+
+/**
+ * Normalizes a persisted nullable JSON text column into a strictly typed canonical field:
+ * - null / undefined -> tag 'N' (empty)
+ * - valid JSON text  -> tag 'J' with recursively sorted keys (key-order invariant)
+ * - invalid raw text -> tag 'R' preserving exact raw bytes (distinct from null and valid JSON)
+ */
+export function canonicalizeNullableJsonField(
+  name: string,
+  raw: string | null | undefined
+): CanonicalField {
+  if (raw === null || raw === undefined) {
+    return { name, type: 'N', value: '' };
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return {
+      name,
+      type: 'J',
+      value: JSON.stringify(canonicalizeJsonValue(parsed)),
+    };
+  } catch {
+    return {
+      name,
+      type: 'R',
+      value: raw,
+    };
+  }
+}
+
+function makeRequiredStringField(name: string, value: string): CanonicalField {
+  return { name, type: 'S', value };
+}
+
+function makeNullableStringField(name: string, value: string | null | undefined): CanonicalField {
+  if (value === null || value === undefined) {
+    return { name, type: 'N', value: '' };
+  }
+  return { name, type: 'S', value };
+}
+
+function makeRequiredIntField(name: string, value: number): CanonicalField {
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`CANONICAL_INVALID_INTEGER_${name.toUpperCase()}`);
+  }
+  return { name, type: 'I', value: String(value) };
+}
+
+function makeNullableIntField(name: string, value: number | null | undefined): CanonicalField {
+  if (value === null || value === undefined) {
+    return { name, type: 'N', value: '' };
+  }
+  if (!Number.isSafeInteger(value)) {
+    throw new Error(`CANONICAL_INVALID_INTEGER_${name.toUpperCase()}`);
+  }
+  return { name, type: 'I', value: String(value) };
+}
+
+/**
+ * Single shared unambiguous length-prefixed canonical encoder for audit entries and checkpoints.
+ * Each field encodes: `<name>=<type>:<utf8ByteLength>:<exactUtf8Value>\n`
+ * Because every value is prefixed with its exact UTF-8 byte length and explicit type tag,
+ * delimiters (`|`, quotes, backslashes, newlines, NUL bytes, Unicode) can never collide across fields.
+ */
+export function encodeCanonicalRecord(fields: readonly CanonicalField[]): string {
+  const parts: string[] = [];
+  for (const field of fields) {
+    const byteLen = encoder.encode(field.value).byteLength;
+    parts.push(`${field.name}=${field.type}:${byteLen}:${field.value}\n`);
+  }
+  return parts.join('');
+}
+
+export interface AuditEntryHashParams {
   prevHash: string;
   auditId: string;
   actorId: string;
@@ -275,25 +390,61 @@ export async function computeAuditEntryHash(params: {
   resourceType: string;
   resourceId: string;
   result: string;
+  beforeStateJson?: string | null;
+  afterStateJson?: string | null;
+  reason?: string | null;
+  sourceUpdateId?: number | null;
   createdAt: number;
   correlationId: string;
-}): Promise<string> {
-  const canonical = [
-    params.prevHash,
-    params.auditId,
-    params.actorId,
-    params.actorRole,
-    params.action,
-    params.resourceType,
-    params.resourceId,
-    params.result,
-    String(params.createdAt),
-    params.correlationId,
-  ].join('|');
-  return sha256Hex(canonical);
+  hashVersion?: number;
 }
 
-export async function computeAuditCheckpointHash(params: {
+export async function computeAuditEntryHash(params: AuditEntryHashParams): Promise<string> {
+  const version = params.hashVersion ?? CURRENT_AUDIT_HASH_VERSION;
+
+  if (version === 1) {
+    // Legacy v1 read-only verification format for historical rows created prior to migration 0005.
+    const legacyCanonical = [
+      params.prevHash,
+      params.auditId,
+      params.actorId,
+      params.actorRole,
+      params.action,
+      params.resourceType,
+      params.resourceId,
+      params.result,
+      String(params.createdAt),
+      params.correlationId,
+    ].join('|');
+    return sha256Hex(legacyCanonical);
+  }
+
+  if (version === 2) {
+    const canonical = encodeCanonicalRecord([
+      makeRequiredStringField('domain', '7777club.audit_entry'),
+      makeRequiredIntField('hash_version', 2),
+      makeRequiredStringField('prev_entry_hash', params.prevHash),
+      makeRequiredStringField('audit_id', params.auditId),
+      makeRequiredStringField('actor_id', params.actorId),
+      makeRequiredStringField('actor_role', params.actorRole),
+      makeRequiredStringField('action', params.action),
+      makeRequiredStringField('resource_type', params.resourceType),
+      makeRequiredStringField('resource_id', params.resourceId),
+      makeRequiredStringField('result', params.result),
+      canonicalizeNullableJsonField('before_state_json', params.beforeStateJson),
+      canonicalizeNullableJsonField('after_state_json', params.afterStateJson),
+      makeNullableStringField('reason', params.reason),
+      makeNullableIntField('source_update_id', params.sourceUpdateId),
+      makeRequiredIntField('created_at', params.createdAt),
+      makeRequiredStringField('correlation_id', params.correlationId),
+    ]);
+    return sha256Hex(canonical);
+  }
+
+  throw new Error(`UNSUPPORTED_AUDIT_HASH_VERSION:${String(version)}`);
+}
+
+export interface AuditCheckpointHashParams {
   prevCheckpointHash: string;
   checkpointId: string;
   anchorAuditId: string;
@@ -301,15 +452,40 @@ export async function computeAuditCheckpointHash(params: {
   anchorCreatedAt: number;
   purgedCount: number;
   createdAt: number;
-}): Promise<string> {
-  const canonical = [
-    params.prevCheckpointHash,
-    params.checkpointId,
-    params.anchorAuditId,
-    params.anchorEntryHash,
-    String(params.anchorCreatedAt),
-    String(params.purgedCount),
-    String(params.createdAt),
-  ].join('|');
-  return sha256Hex(canonical);
+  hashVersion?: number;
+}
+
+export async function computeAuditCheckpointHash(params: AuditCheckpointHashParams): Promise<string> {
+  const version = params.hashVersion ?? CURRENT_CHECKPOINT_HASH_VERSION;
+
+  if (version === 1) {
+    // Legacy v1 read-only verification format for historical checkpoints prior to migration 0005.
+    const legacyCanonical = [
+      params.prevCheckpointHash,
+      params.checkpointId,
+      params.anchorAuditId,
+      params.anchorEntryHash,
+      String(params.anchorCreatedAt),
+      String(params.purgedCount),
+      String(params.createdAt),
+    ].join('|');
+    return sha256Hex(legacyCanonical);
+  }
+
+  if (version === 2) {
+    const canonical = encodeCanonicalRecord([
+      makeRequiredStringField('domain', '7777club.audit_checkpoint'),
+      makeRequiredIntField('hash_version', 2),
+      makeRequiredStringField('prev_checkpoint_hash', params.prevCheckpointHash),
+      makeRequiredStringField('checkpoint_id', params.checkpointId),
+      makeRequiredStringField('anchor_audit_id', params.anchorAuditId),
+      makeRequiredStringField('anchor_entry_hash', params.anchorEntryHash),
+      makeRequiredIntField('anchor_created_at', params.anchorCreatedAt),
+      makeRequiredIntField('purged_count', params.purgedCount),
+      makeRequiredIntField('created_at', params.createdAt),
+    ]);
+    return sha256Hex(canonical);
+  }
+
+  throw new Error(`UNSUPPORTED_CHECKPOINT_HASH_VERSION:${String(version)}`);
 }
