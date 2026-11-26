@@ -91,15 +91,50 @@ export const depositRepository = {
       );
   },
 
+  async getLatestByTicket(db: D1Database, ticketId: string): Promise<DepositRequestRow | null> {
+    return db
+      .prepare(
+        `SELECT * FROM deposit_requests
+         WHERE ticket_id = ?1
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .bind(ticketId)
+      .first<DepositRequestRow>();
+  },
+
   prepareCustomerCancel(
     db: D1Database,
     params: {
       depositId: string;
       customerId: string;
+      expectedVersion?: number;
       mutationToken: string;
       nowMs: number;
     }
   ): D1PreparedStatement {
+    if (params.expectedVersion !== undefined) {
+      return db
+        .prepare(
+          `UPDATE deposit_requests
+           SET status = 'CANCELLED_BY_CUSTOMER',
+               version = version + 1,
+               last_mutation_token = ?3,
+               updated_at = ?4
+           WHERE deposit_id = ?1
+             AND customer_id = ?2
+             AND status = 'SUBMITTED'
+             AND version = ?5
+           RETURNING *`
+        )
+        .bind(
+          params.depositId,
+          params.customerId,
+          params.mutationToken,
+          params.nowMs,
+          params.expectedVersion
+        );
+    }
+
     return db
       .prepare(
         `UPDATE deposit_requests

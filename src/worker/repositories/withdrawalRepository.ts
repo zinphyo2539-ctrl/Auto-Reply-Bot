@@ -95,15 +95,52 @@ export const withdrawalRepository = {
       );
   },
 
+  async getLatestByTicket(db: D1Database, ticketId: string): Promise<WithdrawalRequestRow | null> {
+    return db
+      .prepare(
+        `SELECT * FROM withdrawal_requests
+         WHERE ticket_id = ?1
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .bind(ticketId)
+      .first<WithdrawalRequestRow>();
+  },
+
   prepareCustomerCancel(
     db: D1Database,
     params: {
       withdrawalId: string;
       customerId: string;
+      expectedVersion?: number;
       mutationToken: string;
       nowMs: number;
     }
   ): D1PreparedStatement {
+    if (params.expectedVersion !== undefined) {
+      return db
+        .prepare(
+          `UPDATE withdrawal_requests
+           SET status = 'CANCELLED_BY_CUSTOMER',
+               destination_ciphertext = 'REDACTED',
+               destination_iv = 'REDACTED',
+               version = version + 1,
+               last_mutation_token = ?3,
+               updated_at = ?4
+           WHERE withdrawal_id = ?1
+             AND customer_id = ?2
+             AND status = 'SUBMITTED'
+             AND version = ?5
+           RETURNING *`
+        )
+        .bind(
+          params.withdrawalId,
+          params.customerId,
+          params.mutationToken,
+          params.nowMs,
+          params.expectedVersion
+        );
+    }
+
     return db
       .prepare(
         `UPDATE withdrawal_requests
@@ -134,12 +171,20 @@ export const withdrawalRepository = {
       nowMs: number;
     }
   ): D1PreparedStatement {
-    // Enforce explicit valid state transitions:
-    // - PAID_RECORDED can ONLY be reached from APPROVED_FOR_PAYOUT (or UNDER_REVIEW/SUBMITTED when recording direct verified payout) with non-empty paymentEvidenceRef
-    const allowedFromClause =
-      params.newStatus === 'PAID_RECORDED'
-        ? `status IN ('APPROVED_FOR_PAYOUT', 'UNDER_REVIEW', 'SUBMITTED')`
-        : `status IN ('SUBMITTED', 'UNDER_REVIEW', 'NEEDS_INFO')`;
+    // Explicit strict withdrawal state transition policy:
+    // SUBMITTED -> UNDER_REVIEW (SUPER_ADMIN) | CANCELLED_BY_CUSTOMER (owning customer)
+    // UNDER_REVIEW -> NEEDS_INFO | APPROVED_FOR_PAYOUT | REJECTED (SUPER_ADMIN)
+    // NEEDS_INFO -> UNDER_REVIEW (SUPER_ADMIN)
+    // APPROVED_FOR_PAYOUT -> REJECTED | NEEDS_INFO | PAID_RECORDED (SUPER_ADMIN)
+    // PAID_RECORDED, REJECTED, CANCELLED_BY_CUSTOMER are terminal.
+    const allowedFromMap: Record<typeof params.newStatus, string> = {
+      UNDER_REVIEW: `status IN ('SUBMITTED', 'NEEDS_INFO')`,
+      NEEDS_INFO: `status IN ('UNDER_REVIEW', 'APPROVED_FOR_PAYOUT')`,
+      APPROVED_FOR_PAYOUT: `status = 'UNDER_REVIEW'`,
+      REJECTED: `status IN ('UNDER_REVIEW', 'APPROVED_FOR_PAYOUT')`,
+      PAID_RECORDED: `status = 'APPROVED_FOR_PAYOUT'`,
+    };
+    const allowedFromClause = allowedFromMap[params.newStatus];
 
     return db
       .prepare(

@@ -65,6 +65,7 @@ export const messageRepository = {
       mediaFileId?: string | null;
       mediaFileUniqueId?: string | null;
       isPotentialSlip: boolean;
+      includeInAiContext?: boolean;
       deliveryStatus: 'RECEIVED' | 'PENDING' | 'SENT' | 'DELIVERY_UNCERTAIN' | 'PERMANENT_FAILURE';
       createdAt: number;
       gateCustomerMode?: 'AI' | 'HUMAN';
@@ -75,12 +76,11 @@ export const messageRepository = {
     }
   ): D1PreparedStatement {
     assertStrictCustomerId(msg.customerId);
-    const includeInAiContext =
+    const defaultIncludeInAi =
       ['USER', 'MODEL', 'ADMIN'].includes(msg.senderRole) &&
       msg.messageType === 'TEXT' &&
-      !msg.isPotentialSlip
-        ? 1
-        : 0;
+      !msg.isPotentialSlip;
+    const includeInAiContext = (msg.includeInAiContext ?? defaultIncludeInAi) ? 1 : 0;
 
     if (msg.gateTable && msg.gatePkColumn && msg.gatePkValue && msg.gateMutationToken) {
       return db

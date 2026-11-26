@@ -21,6 +21,10 @@ export default {
     env: Env,
     _ctx: ExecutionContext
   ): Promise<void> {
+    if (batch.queue.toLowerCase().includes('dlq')) {
+      await outboxConsumer.processDlqBatch(env, batch);
+      return;
+    }
     await outboxConsumer.processBatch(env, batch);
   },
 

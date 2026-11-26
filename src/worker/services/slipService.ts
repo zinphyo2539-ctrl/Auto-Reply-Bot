@@ -11,6 +11,7 @@ import { outboxService } from './outboxService';
 import { notificationService, STANDARD_SLIP_ACK_MY } from './notificationService';
 import { generateMutationToken, generatePrefixedId } from '../lib/ids';
 import { systemClock } from '../lib/clock';
+import { escapeHtml } from '../lib/textChunker';
 import { AuthorizationError, ConflictError, NotFoundError, ValidationError } from '../lib/errors';
 
 export const slipService = {
@@ -30,6 +31,11 @@ export const slipService = {
     }
   ): Promise<{ slip: SlipReviewRow; ticketId: string; isDuplicateWarning: boolean }> {
     const nowMs = params.nowMs ?? systemClock.now();
+    const existingCustomer = await customerRepository.getById(env.DB, params.customerId);
+    if (existingCustomer && existingCustomer.account_status === 'BANNED') {
+      throw new AuthorizationError('Customer account is suspended');
+    }
+
     const mutationToken = generateMutationToken(nowMs);
     const slipId = generatePrefixedId('slp', nowMs);
     const messageId = generatePrefixedId('msg', nowMs);
@@ -131,7 +137,7 @@ export const slipService = {
       aggregateType: 'SLIP',
       aggregateId: slipId,
       targetChatId: params.customerId,
-      text: `${STANDARD_SLIP_ACK_MY}\n(Slip ID: <code>${slipId}</code>)`,
+      text: `${STANDARD_SLIP_ACK_MY}\n(Slip ID: <code>${escapeHtml(slipId)}</code>)`,
       parseMode: 'HTML',
       relatedTicketId: ticketId,
       correlationId: params.correlationId,
@@ -153,29 +159,27 @@ export const slipService = {
       nowMs,
     });
 
-    const auditStmt = await auditRepository.buildInsertStatement(env.DB, {
-      actorId: params.customerId,
-      actorRole: 'CUSTOMER',
-      action: isDuplicateWarning ? 'SLIP_SUBMITTED_DUPLICATE_DETECTED' : 'SLIP_SUBMITTED',
-      resourceType: 'SLIP',
-      resourceId: slipId,
-      result: 'SUCCESS',
-      afterState: {
-        slipId,
-        ticketId,
-        isDuplicateWarning,
-        duplicateContext: slipRow.duplicate_context_json,
-      },
-      correlationId: params.correlationId,
-      sourceUpdateId: params.updateId,
-      nowMs,
-    });
-
-    await executeAtomicBatch(env.DB, [
-      auditStmt,
-      ...stagedCustAck.statements,
-      ...stagedGroupAlert.statements,
-    ]);
+    await auditRepository.executeBatchWithAudit(
+      env.DB,
+      (auditStmt) => [auditStmt, ...stagedCustAck.statements, ...stagedGroupAlert.statements],
+      {
+        actorId: params.customerId,
+        actorRole: 'CUSTOMER',
+        action: isDuplicateWarning ? 'SLIP_SUBMITTED_DUPLICATE_DETECTED' : 'SLIP_SUBMITTED',
+        resourceType: 'SLIP',
+        resourceId: slipId,
+        result: 'SUCCESS',
+        afterState: {
+          slipId,
+          ticketId,
+          isDuplicateWarning,
+          duplicateContext: slipRow.duplicate_context_json,
+        },
+        correlationId: params.correlationId,
+        sourceUpdateId: params.updateId,
+        nowMs,
+      }
+    );
 
     await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, [
       ...stagedCustAck.queuePayloads,
@@ -227,12 +231,13 @@ export const slipService = {
     }
 
     const mutationToken = generateMutationToken(nowMs);
+    const safeNote = escapeHtml(trimmedNote ?? '');
     const customerNotice =
       params.decision === 'APPROVED'
-        ? `✅ သင်၏ ငွေလွှဲပြေစာ (<code>${params.slipId}</code>) ကို Admin မှ စစ်ဆေးအတည်ပြုပြီးပါပြီ။`
+        ? `✅ သင်၏ ငွေလွှဲပြေစာ (<code>${escapeHtml(params.slipId)}</code>) ကို Admin မှ စစ်ဆေးအတည်ပြုပြီးပါပြီ။`
         : params.decision === 'REJECTED'
-        ? `❌ သင်၏ ငွေလွှဲပြေစာ (<code>${params.slipId}</code>) ကို ပယ်ချလိုက်ပါသည်။\nအကြောင်းပြချက်: ${trimmedNote}`
-        : `❓ သင်၏ ငွေလွှဲပြေစာ (<code>${params.slipId}</code>) အတွက် အချက်အလက်ထပ်မံလိုအပ်ပါသည်။\nမှတ်ချက်: ${trimmedNote}`;
+        ? `❌ သင်၏ ငွေလွှဲပြေစာ (<code>${escapeHtml(params.slipId)}</code>) ကို ပယ်ချလိုက်ပါသည်။\nအကြောင်းပြချက်: ${safeNote}`
+        : `❓ သင်၏ ငွေလွှဲပြေစာ (<code>${escapeHtml(params.slipId)}</code>) အတွက် အချက်အလက်ထပ်မံလိုအပ်ပါသည်။\nမှတ်ချက်: ${safeNote}`;
 
     const stagedNotice = outboxService.prepareChunkedTextOutbox(env.DB, {
       baseOutboxId: generatePrefixedId('obx', nowMs),
@@ -254,8 +259,21 @@ export const slipService = {
       },
     });
 
-    const auditStmt = await auditRepository.buildInsertStatement(
+    const results = await auditRepository.executeBatchWithAudit(
       env.DB,
+      (auditStmt) => [
+        slipRepository.prepareAtomicAdminReviewDecision(env.DB, {
+          slipId: params.slipId,
+          actorAdminId: params.adminId,
+          decision: params.decision,
+          reviewNote: trimmedNote,
+          expectedVersion: params.expectedVersion,
+          mutationToken,
+          nowMs,
+        }),
+        auditStmt,
+        ...stagedNotice.statements,
+      ],
       {
         actorId: params.adminId,
         actorRole: admin.role,
@@ -277,20 +295,6 @@ export const slipService = {
         mutationToken,
       }
     );
-
-    const results = await executeAtomicBatch(env.DB, [
-      slipRepository.prepareAtomicAdminReviewDecision(env.DB, {
-        slipId: params.slipId,
-        actorAdminId: params.adminId,
-        decision: params.decision,
-        reviewNote: trimmedNote,
-        expectedVersion: params.expectedVersion,
-        mutationToken,
-        nowMs,
-      }),
-      auditStmt,
-      ...stagedNotice.statements,
-    ]);
 
     const updated = (results[0]?.results?.[0] as unknown as SlipReviewRow | undefined) ?? null;
     if (!updated) {

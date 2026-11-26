@@ -132,7 +132,22 @@ export const configRepository = {
         SELECT
           active_version, ai_enabled, welcome_text_my, welcome_text_en,
           welcome_image_file_id, system_prompt, menu_buttons_json, payment_methods_json,
-          '[]', min_deposit_amount, max_deposit_amount,
+          COALESCE(
+            (
+              SELECT json_group_array(
+                json_object(
+                  'faqId', faq_id,
+                  'questionMy', question_my,
+                  'questionEn', question_en,
+                  'displayOrder', display_order,
+                  'isEnabled', is_enabled
+                )
+              )
+              FROM faq_entries
+            ),
+            '[]'
+          ),
+          min_deposit_amount, max_deposit_amount,
           min_withdrawal_amount, max_withdrawal_amount, currency,
           reminder_minutes, escalation_minutes, ?2,
           updated_by_admin_id, updated_at

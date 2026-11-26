@@ -7,8 +7,115 @@ import { telegramService } from '../services/telegramService';
 import { outboxService } from '../services/outboxService';
 import { generateLeaseToken, generatePrefixedId } from '../lib/ids';
 import { systemClock } from '../lib/clock';
+import { escapeHtml } from '../lib/textChunker';
 import { ExternalServiceError, PermanentProcessingError, RateLimitError } from '../lib/errors';
 import { logger } from '../lib/logger';
+
+const QUEUE_EVENT_TTL_MS = 7 * 86400000;
+const QUEUE_EVENT_STALE_LEASE_MS = 45_000;
+
+interface QueueEventRow {
+  event_id: string;
+  outbox_id: string;
+  consumer_lease_token: string;
+  outcome: 'IN_PROGRESS' | 'COMPLETED' | 'ABORTED';
+  processed_at: number;
+  expires_at: number;
+}
+
+/**
+ * F-06C: Durable pre-claim idempotency guard backed by processed_queue_events.
+ * Prevents duplicate queue event delivery from racing or re-processing completed/active events.
+ */
+async function acquireQueueEventGuard(
+  env: Env,
+  queueEventId: string | undefined,
+  outboxId: string,
+  consumerLeaseToken: string,
+  nowMs: number
+): Promise<boolean> {
+  if (!queueEventId) return true;
+
+  const inserted = await env.DB
+    .prepare(
+      `INSERT INTO processed_queue_events (
+         event_id, outbox_id, consumer_lease_token, outcome, processed_at, expires_at
+       ) VALUES (?1, ?2, ?3, 'IN_PROGRESS', ?4, ?5)
+       ON CONFLICT(event_id) DO NOTHING
+       RETURNING *`
+    )
+    .bind(queueEventId, outboxId, consumerLeaseToken, nowMs, nowMs + QUEUE_EVENT_TTL_MS)
+    .first<QueueEventRow>();
+
+  if (inserted) {
+    return true;
+  }
+
+  const existing = await env.DB
+    .prepare('SELECT * FROM processed_queue_events WHERE event_id = ?1')
+    .bind(queueEventId)
+    .first<QueueEventRow>();
+
+  if (!existing) {
+    return false;
+  }
+
+  if (existing.outcome === 'COMPLETED' || existing.outcome === 'ABORTED') {
+    return false;
+  }
+
+  // Only reclaim IN_PROGRESS queue event if its lease is stale
+  if (existing.processed_at > nowMs - QUEUE_EVENT_STALE_LEASE_MS) {
+    return false;
+  }
+
+  const reclaimed = await env.DB
+    .prepare(
+      `UPDATE processed_queue_events
+       SET consumer_lease_token = ?2,
+           processed_at = ?3,
+           expires_at = ?4
+       WHERE event_id = ?1
+         AND outcome = 'IN_PROGRESS'
+         AND processed_at <= ?5
+       RETURNING *`
+    )
+    .bind(
+      queueEventId,
+      consumerLeaseToken,
+      nowMs,
+      nowMs + QUEUE_EVENT_TTL_MS,
+      nowMs - QUEUE_EVENT_STALE_LEASE_MS
+    )
+    .first<QueueEventRow>();
+
+  return reclaimed !== null;
+}
+
+async function finalizeQueueEventGuard(
+  env: Env,
+  queueEventId: string | undefined,
+  consumerLeaseToken: string,
+  outcome: 'COMPLETED' | 'ABORTED',
+  nowMs: number
+): Promise<void> {
+  if (!queueEventId) return;
+  try {
+    await env.DB
+      .prepare(
+        `UPDATE processed_queue_events
+         SET outcome = ?3,
+             processed_at = ?4,
+             expires_at = ?5
+         WHERE event_id = ?1
+           AND consumer_lease_token = ?2`
+      )
+      .bind(queueEventId, consumerLeaseToken, outcome, nowMs, nowMs + QUEUE_EVENT_TTL_MS)
+      .run();
+  } catch {
+    // Non-fatal; outbox lease remains authoritative
+  }
+}
 
 export const outboxConsumer = {
   async processBatch(env: Env, batch: MessageBatch<OutboxQueuePayload>): Promise<void> {
@@ -27,6 +134,96 @@ export const outboxConsumer = {
         msg.retry();
       }
     }
+  },
+
+  /**
+   * F-06D: Explicit Dead-Letter Queue consumer.
+   * Never auto-replays messages (avoids duplicate non-idempotent sends) and never logs payloads/PII.
+   * Persists an immutable audit record, sends a bounded non-sensitive alert to started SUPER_ADMINs, and acks.
+   */
+  async processDlqBatch(
+    env: Env,
+    batch: MessageBatch<OutboxQueuePayload>,
+    nowMs = systemClock.now()
+  ): Promise<{ processedCount: number }> {
+    let processedCount = 0;
+
+    for (const msg of batch.messages) {
+      const outboxId = msg.body?.outboxId ?? `unknown:${msg.id}`;
+      const eventId = msg.body?.eventId ?? msg.id;
+      const correlationId = msg.body?.correlationId ?? generatePrefixedId('dlq', nowMs);
+
+      logger.log({
+        level: 'ERROR',
+        event: 'OUTBOX_DLQ_MESSAGE_RECEIVED',
+        correlationId,
+        outboxId,
+        metadata: {
+          queue: batch.queue,
+          messageId: msg.id,
+          eventId,
+          attempts: msg.attempts,
+        },
+      });
+
+      const existingOutbox = msg.body?.outboxId
+        ? await outboxRepository.getById(env.DB, msg.body.outboxId)
+        : null;
+
+      await auditRepository.appendImmediate(env.DB, {
+        actorId: 'OUTBOX_DLQ_CONSUMER',
+        actorRole: 'SYSTEM',
+        action: 'OUTBOX_DLQ_EVENT_RECORDED',
+        resourceType: 'OUTBOX',
+        resourceId: outboxId,
+        result: 'FAILURE',
+        afterState: {
+          queue: batch.queue,
+          messageId: msg.id,
+          eventId,
+          attempts: msg.attempts,
+          outboxStatus: existingOutbox?.status ?? 'UNKNOWN',
+          outboxEventType: existingOutbox?.event_type ?? 'UNKNOWN',
+        },
+        reason: 'Queue message routed to DLQ; manual inspection required (auto-replay forbidden)',
+        correlationId,
+        nowMs,
+      });
+
+      // Avoid alert recursion if the DLQ message itself was already a DLQ_ALERT
+      if (existingOutbox?.event_type !== 'DLQ_ALERT') {
+        const superAdmins = await adminRepository.listActiveSuperAdmins(env.DB);
+        const alertStmts = [];
+        const alertPayloads: OutboxQueuePayload[] = [];
+
+        for (const sa of superAdmins) {
+          const staged = outboxService.prepareChunkedTextOutbox(env.DB, {
+            baseOutboxId: generatePrefixedId('obx', nowMs),
+            baseIdempotencyKey: `dlq_alert:${outboxId}:${sa.telegram_user_id}`,
+            eventType: 'DLQ_ALERT',
+            aggregateType: 'SYSTEM',
+            aggregateId: outboxId,
+            targetChatId: sa.telegram_user_id,
+            text: `🚨 <b>Outbox Dead-Letter Queue Alert</b>\nOutbox ID: <code>${escapeHtml(outboxId)}</code>\nEvent ID: <code>${escapeHtml(eventId)}</code>\nStatus: <b>${escapeHtml(existingOutbox?.status ?? 'UNKNOWN')}</b>\nManual operator inspection required. Auto-replay is disabled for safety.`,
+            parseMode: 'HTML',
+            correlationId,
+            nowMs,
+          });
+          alertStmts.push(...staged.statements);
+          alertPayloads.push(...staged.queuePayloads);
+        }
+
+        if (alertStmts.length > 0) {
+          await executeAtomicBatch(env.DB, alertStmts);
+          await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, alertPayloads);
+        }
+      }
+
+      msg.ack();
+      processedCount++;
+    }
+
+    return { processedCount };
   },
 
   async processSingleOutbox(
@@ -53,6 +250,12 @@ export const outboxConsumer = {
     const leaseOwner = queueEventId ?? generatePrefixedId('con', nowMs);
     const leaseToken = generateLeaseToken(nowMs);
 
+    // F-06C: Durable pre-claim deduplication via processed_queue_events
+    const acquiredEvent = await acquireQueueEventGuard(env, queueEventId, outboxId, leaseToken, nowMs);
+    if (!acquiredEvent) {
+      return { outcome: 'SKIPPED' };
+    }
+
     // Phase 1: PENDING | RETRYABLE_FAILURE -> CLAIMED (enforcing per-chat ordering)
     const claimed = await outboxRepository.claimForConsumer(env.DB, {
       outboxId,
@@ -61,12 +264,14 @@ export const outboxConsumer = {
       nowMs,
     });
     if (!claimed) {
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', nowMs);
       return { outcome: 'SKIPPED' };
     }
 
     // Phase 2: CLAIMED -> SENDING immediately prior to network dispatch
     const markedSending = await outboxRepository.markSending(env.DB, outboxId, leaseToken, nowMs);
     if (!markedSending) {
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', nowMs);
       return { outcome: 'SKIPPED' };
     }
 
@@ -79,12 +284,26 @@ export const outboxConsumer = {
         payload
       );
 
-      await outboxRepository.markSent(env.DB, {
+      const sentNow = systemClock.now();
+      const markedSent = await outboxRepository.markSent(env.DB, {
         outbox: claimed,
         leaseToken,
         telegramMessageId: apiRes.messageId,
-        nowMs: systemClock.now(),
+        nowMs: sentNow,
       });
+
+      if (!markedSent) {
+        logger.log({
+          level: 'WARN',
+          event: 'OUTBOX_LEASE_LOST_AFTER_TELEGRAM_SEND',
+          correlationId,
+          outboxId,
+        });
+        await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', sentNow);
+        return { outcome: 'SKIPPED' };
+      }
+
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'COMPLETED', sentNow);
       return { outcome: 'SENT' };
     } catch (err) {
       const errNow = systemClock.now();
@@ -98,28 +317,32 @@ export const outboxConsumer = {
           errorMsg: err.message,
           nowMs: errNow,
         });
+        await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
         return { outcome: 'RETRYABLE_FAILURE' };
       }
 
       if (err instanceof ExternalServiceError) {
         if (err.isUncertainDelivery && claimed.is_idempotent_method === 0) {
-          await outboxRepository.markDeliveryUncertain(env.DB, {
+          const markedUncertain = await outboxRepository.markDeliveryUncertain(env.DB, {
             outbox: claimed,
             leaseToken,
             errorMsg: err.message,
             nowMs: errNow,
           });
-          await auditRepository.appendImmediate(env.DB, {
-            actorId: leaseOwner,
-            actorRole: 'SYSTEM',
-            action: 'OUTBOX_MARKED_DELIVERY_UNCERTAIN',
-            resourceType: 'OUTBOX',
-            resourceId: outboxId,
-            result: 'FAILURE',
-            reason: err.message,
-            correlationId,
-            nowMs: errNow,
-          });
+          if (markedUncertain) {
+            await auditRepository.appendImmediate(env.DB, {
+              actorId: leaseOwner,
+              actorRole: 'SYSTEM',
+              action: 'OUTBOX_MARKED_DELIVERY_UNCERTAIN',
+              resourceType: 'OUTBOX',
+              resourceId: outboxId,
+              result: 'FAILURE',
+              reason: err.message,
+              correlationId,
+              nowMs: errNow,
+            });
+          }
+          await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
           return { outcome: 'DELIVERY_UNCERTAIN' };
         }
 
@@ -132,18 +355,30 @@ export const outboxConsumer = {
             errorMsg: err.message,
             nowMs: errNow,
           });
+          await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
           return { outcome: 'RETRYABLE_FAILURE' };
         }
       }
 
       // Permanent failure (e.g. 400/403 bot blocked/kicked)
       const errMsg = err instanceof Error ? err.message : String(err);
-      await outboxRepository.markPermanentFailure(env.DB, {
+      const markedPerm = await outboxRepository.markPermanentFailure(env.DB, {
         outbox: claimed,
         leaseToken,
         errorMsg: errMsg,
         nowMs: errNow,
       });
+
+      if (!markedPerm) {
+        logger.log({
+          level: 'WARN',
+          event: 'OUTBOX_LEASE_LOST_BEFORE_PERMANENT_FAILURE',
+          correlationId,
+          outboxId,
+        });
+        await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+        return { outcome: 'SKIPPED' };
+      }
 
       await auditRepository.appendImmediate(env.DB, {
         actorId: leaseOwner,
@@ -175,7 +410,7 @@ export const outboxConsumer = {
             aggregateType: 'SYSTEM',
             aggregateId: outboxId,
             targetChatId: sa.telegram_user_id,
-            text: `🚨 <b>EMERGENCY ADMIN GROUP DELIVERY FAILURE</b>\nCould not deliver alert <code>${outboxId}</code> to group <code>${claimed.target_chat_id}</code>.\nError: <code>${errMsg}</code>`,
+            text: `🚨 <b>EMERGENCY ADMIN GROUP DELIVERY FAILURE</b>\nCould not deliver alert <code>${escapeHtml(outboxId)}</code> to group <code>${escapeHtml(claimed.target_chat_id)}</code>.\nError: <code>${escapeHtml(errMsg)}</code>`,
             parseMode: 'HTML',
             correlationId,
             nowMs: errNow,
@@ -190,6 +425,7 @@ export const outboxConsumer = {
         }
       }
 
+      await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
       return { outcome: 'PERMANENT_FAILURE' };
     }
   },

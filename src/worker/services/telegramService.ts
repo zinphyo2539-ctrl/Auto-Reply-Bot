@@ -28,6 +28,7 @@ export const telegramService = {
       throw new PermanentProcessingError('TELEGRAM_BOT_TOKEN_NOT_CONFIGURED');
     }
 
+    const isIdempotentMethod = method === 'editMessageText' || method === 'answerCallbackQuery';
     const url = `https://api.telegram.org/bot${botToken}/${method}`;
     let response: Response;
 
@@ -49,10 +50,20 @@ export const telegramService = {
         errName === 'AbortError' ||
         /timeout|aborted/i.test(errMsg);
 
+      // F-06A: Non-idempotent sendMessage/sendPhoto transport exceptions have uncertain delivery outcome
+      // and must NEVER be blindly auto-retried.
+      if (!isIdempotentMethod) {
+        throw new ExternalServiceError(`Telegram transport failure on ${method}: ${errMsg}`, {
+          retryable: false,
+          isUncertainDelivery: true,
+          code: isTimeout ? 'TELEGRAM_POST_SEND_TIMEOUT' : 'TELEGRAM_UNCERTAIN_TRANSPORT_ERROR',
+        });
+      }
+
       throw new ExternalServiceError(`Telegram network error on ${method}: ${errMsg}`, {
-        retryable: !isTimeout,
-        isUncertainDelivery: isTimeout && method !== 'editMessageText' && method !== 'answerCallbackQuery',
-        code: isTimeout ? 'TELEGRAM_POST_SEND_TIMEOUT' : 'TELEGRAM_NETWORK_ERROR',
+        retryable: true,
+        isUncertainDelivery: false,
+        code: isTimeout ? 'TELEGRAM_IDEMPOTENT_TIMEOUT' : 'TELEGRAM_NETWORK_ERROR',
       });
     }
 
@@ -60,6 +71,13 @@ export const telegramService = {
     try {
       body = (await response.json()) as TelegramApiResponse;
     } catch {
+      if (!isIdempotentMethod && (response.status === 200 || response.status === 502 || response.status === 504)) {
+        throw new ExternalServiceError(`Telegram HTTP ${response.status} non-JSON response on ${method}`, {
+          retryable: false,
+          isUncertainDelivery: true,
+          code: 'TELEGRAM_UNCERTAIN_RESPONSE_BODY',
+        });
+      }
       if (response.status >= 500) {
         throw new ExternalServiceError(`Telegram HTTP ${response.status} non-JSON response`, {
           retryable: true,

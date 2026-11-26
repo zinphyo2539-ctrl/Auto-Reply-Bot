@@ -1,27 +1,35 @@
 import { Hono } from 'hono';
 import type { Env } from '../types/bindings';
-import { verifyTelegramWebhookMiddleware } from '../middleware/verifyTelegramWebhook';
+import {
+  verifyTelegramWebhookMiddleware,
+  type WebhookContextVariables,
+} from '../middleware/verifyTelegramWebhook';
 import { TelegramUpdateSchema } from '../schemas/telegramSchemas';
 import { updateRouter } from '../handlers/updateRouter';
 import { logger } from '../lib/logger';
 import { generatePrefixedId } from '../lib/ids';
 
 export function createApp() {
-  const app = new Hono<{ Bindings: Env }>();
+  const app = new Hono<{ Bindings: Env; Variables: WebhookContextVariables }>();
 
   app.get('/healthz', (c) => {
+    const rawUsername = c.env?.TELEGRAM_BOT_USERNAME?.trim() || 'unconfigured';
+    const normalizedUsername = rawUsername.replace(/^@/, '');
     return c.json({
       ok: true,
       service: 'vip-gaming-bot',
       brand: '7777club',
       environment: c.env?.ENVIRONMENT ?? 'unknown',
+      bot_username: normalizedUsername,
+      timezone: c.env?.APP_TIMEZONE ?? 'Asia/Yangon',
     });
   });
 
   app.post('/webhook', verifyTelegramWebhookMiddleware, async (c) => {
     let rawJson: unknown;
     try {
-      rawJson = await c.req.json();
+      const rawBody = c.get('rawWebhookBody');
+      rawJson = JSON.parse(rawBody);
     } catch {
       return c.json({ ok: false, error: 'Malformed JSON body' }, 400);
     }

@@ -62,10 +62,10 @@ export const adminRepository = {
           telegram_user_id, role, is_active, has_started_bot,
           permissions_json, display_name, last_seen_at,
           version, last_mutation_token, created_at, updated_at
-        ) VALUES (?1, 'SUPER_ADMIN', 1, 1, ?2, ?3, ?4, 1, ?5, ?4, ?4)
+        ) VALUES (?1, 'SUPER_ADMIN', 1, 0, ?2, ?3, NULL, 1, ?5, ?4, ?4)
         ON CONFLICT(telegram_user_id) DO UPDATE SET
-          has_started_bot = 1,
-          last_seen_at = ?4,
+          role = 'SUPER_ADMIN',
+          permissions_json = excluded.permissions_json,
           version = admins.version + 1,
           last_mutation_token = ?5,
           updated_at = ?4

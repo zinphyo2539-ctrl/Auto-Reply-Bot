@@ -327,3 +327,14 @@ export interface AuditLogRow {
   entry_hash: string;
   created_at: number;
 }
+
+export interface AuditRetentionCheckpointRow {
+  checkpoint_id: string;
+  prev_checkpoint_hash: string;
+  anchor_audit_id: string;
+  anchor_entry_hash: string;
+  anchor_created_at: number;
+  purged_count: number;
+  checkpoint_hash: string;
+  created_at: number;
+}

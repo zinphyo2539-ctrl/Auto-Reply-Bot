@@ -26,6 +26,7 @@ export const outboxService = {
       correlationId: string;
       nowMs: number;
       gateCondition?: EnqueueOutboxSpec['gateCondition'];
+      customerModeGate?: EnqueueOutboxSpec['customerModeGate'];
     }
   ): StagedOutboxBatch {
     const chunks = chunkTelegramText(params.text, 3800);
@@ -69,6 +70,7 @@ export const outboxService = {
           availableAt,
           nowMs: params.nowMs,
           gateCondition: params.gateCondition,
+          customerModeGate: params.customerModeGate,
         })
       );
 
@@ -82,6 +84,23 @@ export const outboxService = {
     });
 
     return { statements, queuePayloads };
+  },
+
+  filterCreatedQueuePayloads(
+    batchResults: Array<{ results?: Array<Record<string, unknown>> }>,
+    startIndex: number,
+    queuePayloads: OutboxQueuePayload[]
+  ): OutboxQueuePayload[] {
+    const createdIds = new Set<string>();
+    for (let i = 0; i < queuePayloads.length; i++) {
+      const rows = batchResults[startIndex + i]?.results ?? [];
+      for (const row of rows) {
+        if (typeof row.outbox_id === 'string') {
+          createdIds.add(row.outbox_id);
+        }
+      }
+    }
+    return queuePayloads.filter((p) => createdIds.has(p.outboxId));
   },
 
   async dispatchQueueSignalsBestEffort(

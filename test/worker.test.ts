@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
 import path from 'node:path';
 import { SqliteD1Adapter } from '../src/worker/testing/sqliteD1Adapter';
 import type { Env, OutboxQueuePayload, QueueProducer } from './testHelpers';
@@ -12,19 +13,24 @@ import { adminService } from '../src/worker/services/adminService';
 import { outboxConsumer } from '../src/worker/queues/outboxConsumer';
 import { scheduledDispatcher } from '../src/worker/scheduled/dispatcher';
 import { auditRepository } from '../src/worker/repositories/auditRepository';
+import { outboxRepository } from '../src/worker/repositories/outboxRepository';
+import { adminRepository } from '../src/worker/repositories/adminRepository';
+import workerEntry from '../src/worker/index';
 import {
   encryptPayoutDestination,
   decryptPayoutDestination,
+  parseAes256KeyBytes,
 } from '../src/worker/lib/crypto';
 import { encodeCallbackData, decodeCallbackData } from '../src/worker/lib/callbackCodec';
-import { chunkTelegramText } from '../src/worker/lib/textChunker';
+import { chunkTelegramText, escapeHtml } from '../src/worker/lib/textChunker';
 import { redactLogObject } from '../src/worker/lib/logger';
 import { containsForbiddenFinancialCommitment } from '../src/worker/schemas/geminiSchemas';
 
 const MIGRATIONS_DIR = path.resolve(process.cwd(), 'migrations');
 
-const TEST_AES_KEY_V1 = 'test_aes_key_material_v1_32bytes_strong_secret_key';
-const TEST_AES_KEY_V2 = 'test_aes_key_material_v2_32bytes_rotated_secret_key';
+// Valid 32-byte random-pattern base64 keys for AES-256-GCM testing (not production secrets)
+const TEST_AES_KEY_V1 = 'AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=';
+const TEST_AES_KEY_V2 = 'ISAiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=';
 
 function createTestEnv(db: SqliteD1Adapter): {
   env: Env;
@@ -52,12 +58,11 @@ function createTestEnv(db: SqliteD1Adapter): {
     OFFICIAL_CHANNEL_URL: 'https://t.me/slotmyanmar77777',
     GEMINI_MODEL: 'gemini-2.5-flash',
     APP_TIMEZONE: 'Asia/Yangon',
-    SUPPORT_REMINDER_MINUTES: '30',
-    SUPPORT_ESCALATION_MINUTES: '60',
-    RETENTION_MESSAGES_DAYS: '90',
-    RETENTION_FINGERPRINTS_DAYS: '180',
+    RETENTION_MESSAGES_DAYS: '180',
+    RETENTION_FINGERPRINTS_DAYS: '365',
     RETENTION_AUDIT_DAYS: '365',
     RETENTION_WITHDRAWAL_PII_DAYS: '30',
+    RETENTION_OUTBOX_DAYS: '30',
     ENCRYPTION_KEY_VERSION: '1',
     TELEGRAM_BOT_TOKEN: '123456:TEST_BOT_TOKEN_NOT_REAL_XYZ',
     TELEGRAM_WEBHOOK_SECRET: 'super_secret_webhook_token_v2',
@@ -726,26 +731,57 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       expect(r.payload_json).not.toContain('09451234567');
     }
 
-    // AES-256-GCM key rotation (v1 ciphertext decryptable when v2 active & v1 previous) + tamper AAD rejection
+    // AES-256-GCM key rotation (v1 ciphertext decryptable when v2 active & v1 previous) + per-record AAD tamper rejection
     const decryptedRotated = await decryptPayoutDestination(
       withdrawal.destination_ciphertext,
       withdrawal.destination_iv,
-      { customerId: '6200', methodCode: 'KBZPAY', keyVersion: 1 },
+      {
+        purpose: 'withdrawal_destination',
+        customerId: '6200',
+        recordToken: withdrawal.idempotency_token,
+        methodCode: 'KBZPAY',
+        keyVersion: 1,
+      },
       { currentKey: TEST_AES_KEY_V2, previousKey: TEST_AES_KEY_V1, currentKeyVersion: 2 }
     );
     expect(decryptedRotated).toBe('U Kyaw Min - 09451234567');
 
+    // Wrong customerId AAD rejected
     await expect(
       decryptPayoutDestination(
         withdrawal.destination_ciphertext,
         withdrawal.destination_iv,
-        { customerId: '9999', methodCode: 'KBZPAY', keyVersion: 1 },
+        {
+          purpose: 'withdrawal_destination',
+          customerId: '9999',
+          recordToken: withdrawal.idempotency_token,
+          methodCode: 'KBZPAY',
+          keyVersion: 1,
+        },
+        { currentKey: TEST_AES_KEY_V2, previousKey: TEST_AES_KEY_V1, currentKeyVersion: 2 }
+      )
+    ).rejects.toThrow();
+
+    // Swapped recordToken AAD rejected (cross-record ciphertext transplant protection)
+    await expect(
+      decryptPayoutDestination(
+        withdrawal.destination_ciphertext,
+        withdrawal.destination_iv,
+        {
+          purpose: 'withdrawal_destination',
+          customerId: '6200',
+          recordToken: 'wdt_different_record_token',
+          methodCode: 'KBZPAY',
+          keyVersion: 1,
+        },
         { currentKey: TEST_AES_KEY_V2, previousKey: TEST_AES_KEY_V1, currentKeyVersion: 2 }
       )
     ).rejects.toThrow();
 
     const encV2 = await encryptPayoutDestination('Daw Hla - 09777888999', TEST_AES_KEY_V2, {
+      purpose: 'withdrawal_destination',
       customerId: '6200',
+      recordToken: 'wdt_v2_record_01',
       methodCode: 'WAVEPAY',
       keyVersion: 2,
     });
@@ -786,6 +822,39 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       .first<{ action: string }>();
     expect(piiAudit).not.toBeNull();
 
+    // Strict state machine: direct SUBMITTED -> PAID_RECORDED is forbidden
+    await expect(
+      withdrawalService.submitSuperAdminDecision(env, {
+        adminId: '9001',
+        withdrawalId: withdrawal.withdrawal_id,
+        newStatus: 'PAID_RECORDED',
+        paymentEvidenceRef: 'KBZ-PAYOUT-TXN-EARLY',
+        expectedVersion: 1,
+        correlationId: 'cor_wd_skip_fail',
+      })
+    ).rejects.toThrow(/not in an allowed state|concurrently/i);
+
+    // Strict flow: SUBMITTED (v1) -> UNDER_REVIEW (v2) -> APPROVED_FOR_PAYOUT (v3) -> PAID_RECORDED (v4)
+    const underReview = await withdrawalService.submitSuperAdminDecision(env, {
+      adminId: '9001',
+      withdrawalId: withdrawal.withdrawal_id,
+      newStatus: 'UNDER_REVIEW',
+      expectedVersion: 1,
+      correlationId: 'cor_wd_rev',
+    });
+    expect(underReview.status).toBe('UNDER_REVIEW');
+    expect(underReview.version).toBe(2);
+
+    const approvedForPayout = await withdrawalService.submitSuperAdminDecision(env, {
+      adminId: '9001',
+      withdrawalId: withdrawal.withdrawal_id,
+      newStatus: 'APPROVED_FOR_PAYOUT',
+      expectedVersion: 2,
+      correlationId: 'cor_wd_app',
+    });
+    expect(approvedForPayout.status).toBe('APPROVED_FOR_PAYOUT');
+    expect(approvedForPayout.version).toBe(3);
+
     // Cannot mark PAID_RECORDED without payment_evidence_ref
     await expect(
       withdrawalService.submitSuperAdminDecision(env, {
@@ -793,22 +862,23 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
         withdrawalId: withdrawal.withdrawal_id,
         newStatus: 'PAID_RECORDED',
         paymentEvidenceRef: '',
-        expectedVersion: 1,
+        expectedVersion: 3,
         correlationId: 'cor_wd_paid_fail',
       })
     ).rejects.toThrow(/payment_evidence_ref/i);
 
-    // Mark PAID_RECORDED with evidence ref
+    // Mark PAID_RECORDED with evidence ref from APPROVED_FOR_PAYOUT (v3 -> v4)
     const paid = await withdrawalService.submitSuperAdminDecision(env, {
       adminId: '9001',
       withdrawalId: withdrawal.withdrawal_id,
       newStatus: 'PAID_RECORDED',
       paymentEvidenceRef: 'KBZ-PAYOUT-TXN-776655',
-      expectedVersion: 1,
+      expectedVersion: 3,
       correlationId: 'cor_wd_paid_ok',
     });
     expect(paid.status).toBe('PAID_RECORDED');
     expect(paid.payment_evidence_ref).toBe('KBZ-PAYOUT-TXN-776655');
+    expect(paid.version).toBe(4);
 
     // Customer cancellation immediately redacts ciphertext
     const { draftToken: dt2 } = await withdrawalService.startWithdrawalWizard(env, '6200');
@@ -1079,4 +1149,1435 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(nested.otp).toBe('[REDACTED]');
     expect(nested.note).not.toContain('09123456789');
   });
+
+  // 21. Chunked >256KB Webhook Bypass Protection & /healthz Metadata
+  it('21. Rejects >256KB webhook body even without Content-Length header and reports bot_username/timezone on /healthz', async () => {
+    const app = createApp();
+
+    const healthRes = await app.fetch(new Request('https://bot.example/healthz'), env);
+    expect(healthRes.status).toBe(200);
+    const healthJson = (await healthRes.json()) as Record<string, unknown>;
+    expect(healthJson.ok).toBe(true);
+    expect(healthJson.bot_username).toBe('vip_gaming_support_bot');
+    expect(healthJson.timezone).toBe('Asia/Yangon');
+
+    const oversizedBody = JSON.stringify({
+      update_id: 99001,
+      message: {
+        message_id: 1,
+        date: 1700000000,
+        chat: { id: 7001, type: 'private' },
+        from: { id: 7001, is_bot: false, first_name: 'ChunkUser' },
+        text: 'A'.repeat(270 * 1024),
+      },
+    });
+
+    // Omit Content-Length explicitly to simulate chunked transfer encoding
+    const chunkedRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: oversizedBody,
+      }),
+      env
+    );
+    expect(chunkedRes.status).toBe(413);
+  });
+
+  // 22. Admin /reject_dep & /reject_wd Commands + Manual Admin Wording Verification
+  it('22. Processes /reject_dep and /reject_wd for SUPER_ADMIN, blocks SUPPORT_AGENT, and keeps manual-process wording unambiguous', async () => {
+    const app = createApp();
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '6501',
+      username: 'finu',
+      firstName: 'FinUser',
+      languageCode: 'en',
+    });
+
+    // Create 1 deposit to approve (verify manual wording) and 1 deposit to reject via /reject_dep
+    const d1 = await depositService.startDepositWizard(env, '6501');
+    await depositService.handleAmountInput(env, '6501', '30000');
+    await depositService.handleMethodSelection(env, '6501', 'KBZPAY');
+    await depositService.handleReferenceInput(env, '6501', 'REF-MANUAL-1');
+    const subD1 = await depositService.confirmSubmission(env, {
+      customerId: '6501',
+      draftToken: d1.draftToken,
+      correlationId: 'cor_man_d1',
+    });
+
+    await depositService.submitSuperAdminDecision(env, {
+      adminId: '9001',
+      depositId: subD1.deposit.deposit_id,
+      newStatus: 'APPROVED_MANUAL_CREDITED',
+      adminEvidenceRef: 'EXT-OP-REF-100',
+      expectedVersion: 1,
+      correlationId: 'cor_man_d1_app',
+    });
+
+    const depNotice = await db
+      .prepare(`SELECT payload_json FROM outbox WHERE event_type = 'DEPOSIT_APPROVED_MANUAL_CREDITED' AND aggregate_id = ?1`)
+      .bind(subD1.deposit.deposit_id)
+      .first<{ payload_json: string }>();
+    expect(depNotice).not.toBeNull();
+    expect(depNotice!.payload_json).toContain('Manual Process');
+    expect(depNotice!.payload_json).toContain('authorized Administrator has verified and recorded manual completion');
+
+    const d2 = await depositService.startDepositWizard(env, '6501');
+    await depositService.handleAmountInput(env, '6501', '40000');
+    await depositService.handleMethodSelection(env, '6501', 'KBZPAY');
+    await depositService.handleReferenceInput(env, '6501', 'REF-REJ-2');
+    const subD2 = await depositService.confirmSubmission(env, {
+      customerId: '6501',
+      draftToken: d2.draftToken,
+      correlationId: 'cor_man_d2',
+    });
+
+    // Create withdrawal to reject via /reject_wd
+    const w1 = await withdrawalService.startWithdrawalWizard(env, '6501');
+    await withdrawalService.handleAmountInput(env, '6501', '20000');
+    await withdrawalService.handleMethodSelection(env, '6501', 'KBZPAY');
+    await withdrawalService.handleDestinationInput(env, '6501', 'U Test - 09444555666');
+    const subW1 = await withdrawalService.confirmSubmission(env, {
+      customerId: '6501',
+      draftToken: w1.draftToken,
+      correlationId: 'cor_man_w1',
+    });
+
+    // SUPPORT_AGENT (9002) sending /reject_dep and /reject_wd via webhook gets HTTP 200 (no retry loop) + DENIED audit
+    const agentRejDepRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99099,
+          message: {
+            message_id: 9,
+            date: 1700000000,
+            chat: { id: 9002, type: 'private' },
+            from: { id: 9002, is_bot: false, first_name: 'Agent' },
+            text: `/reject_dep ${subD2.deposit.deposit_id} 1 Unauthorized attempt`,
+          },
+        }),
+      }),
+      env
+    );
+    expect(agentRejDepRes.status).toBe(200);
+
+    const agentRejWdRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99100,
+          message: {
+            message_id: 10,
+            date: 1700000000,
+            chat: { id: 9002, type: 'private' },
+            from: { id: 9002, is_bot: false, first_name: 'Agent' },
+            text: `/reject_wd ${subW1.withdrawal.withdrawal_id} 1 Unauthorized attempt`,
+          },
+        }),
+      }),
+      env
+    );
+    expect(agentRejWdRes.status).toBe(200);
+
+    const deniedAgentAudits = await db
+      .prepare(`SELECT action FROM audit_logs WHERE actor_id = '9002' AND result = 'DENIED'`)
+      .all<{ action: string }>();
+    expect(deniedAgentAudits.results.map((r) => r.action)).toContain('UNAUTHORIZED_DEPOSIT_DECISION_ATTEMPT');
+    expect(deniedAgentAudits.results.map((r) => r.action)).toContain('UNAUTHORIZED_WITHDRAWAL_DECISION_ATTEMPT');
+
+    // SUPER_ADMIN /reject_dep command via webhook
+    const rejDepRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99101,
+          message: {
+            message_id: 11,
+            date: 1700000000,
+            chat: { id: 9001, type: 'private' },
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            text: `/reject_dep ${subD2.deposit.deposit_id} 1 Invalid <slip> & reference`,
+          },
+        }),
+      }),
+      env
+    );
+    expect(rejDepRes.status).toBe(200);
+
+    const depAfterRej = await db
+      .prepare('SELECT status, decision_note FROM deposit_requests WHERE deposit_id = ?1')
+      .bind(subD2.deposit.deposit_id)
+      .first<{ status: string; decision_note: string }>();
+    expect(depAfterRej!.status).toBe('REJECTED');
+
+    // SUPER_ADMIN moves withdrawal SUBMITTED -> UNDER_REVIEW (/review_wd) before /reject_wd
+    const revWdRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99102,
+          message: {
+            message_id: 12,
+            date: 1700000000,
+            chat: { id: 9001, type: 'private' },
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            text: `/review_wd ${subW1.withdrawal.withdrawal_id} 1`,
+          },
+        }),
+      }),
+      env
+    );
+    expect(revWdRes.status).toBe(200);
+
+    // SUPER_ADMIN /reject_wd command via webhook (now version 2, UNDER_REVIEW -> REJECTED)
+    const rejWdRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99103,
+          message: {
+            message_id: 13,
+            date: 1700000000,
+            chat: { id: 9001, type: 'private' },
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            text: `/reject_wd ${subW1.withdrawal.withdrawal_id} 2 Name mismatch <check>`,
+          },
+        }),
+      }),
+      env
+    );
+    expect(rejWdRes.status).toBe(200);
+
+    const wdAfterRej = await db
+      .prepare('SELECT status FROM withdrawal_requests WHERE withdrawal_id = ?1')
+      .bind(subW1.withdrawal.withdrawal_id)
+      .first<{ status: string }>();
+    expect(wdAfterRej!.status).toBe('REJECTED');
+
+    // Verify HTML special chars in rejection reason were escaped cleanly in customer outbox
+    const rejOutbox = await db
+      .prepare(`SELECT payload_json FROM outbox WHERE event_type = 'DEPOSIT_REJECTED' AND aggregate_id = ?1`)
+      .bind(subD2.deposit.deposit_id)
+      .first<{ payload_json: string }>();
+    expect(rejOutbox!.payload_json).toContain('&lt;slip&gt; &amp; reference');
+    expect(rejOutbox!.payload_json).not.toContain('<slip>');
+  });
+
+  // 23. Withdrawal Destination PII Never Enters messages Table or Gemini Prompt + has_started_bot Guard on wd:pii
+  it('23. Guarantees raw withdrawal destination never enters messages or Gemini prompt and requires private /start before wd:pii decrypt', async () => {
+    await db.prepare(`UPDATE config SET ai_enabled = 1 WHERE config_id = 'active'`).run();
+    const cust = await customerService.ensureActiveCustomer(env, {
+      customerId: '6502',
+      username: 'piitest',
+      firstName: 'Pii<User>&Co',
+    });
+
+    await withdrawalService.startWithdrawalWizard(env, '6502');
+    await customerService.handleCustomerText(env, {
+      customer: cust,
+      telegramMessageId: 201,
+      updateId: 99201,
+      text: '35000',
+      correlationId: 'cor_piiw_1',
+    });
+    await withdrawalService.handleMethodSelection(env, '6502', 'KBZPAY');
+    await customerService.handleCustomerText(env, {
+      customer: cust,
+      telegramMessageId: 202,
+      updateId: 99202,
+      text: 'U Secret Account 09888777666',
+      correlationId: 'cor_piiw_2',
+    });
+
+    // Verify plaintext destination is NOT persisted in messages table
+    const storedMsgs = await db
+      .prepare(`SELECT text_content FROM messages WHERE customer_id = '6502'`)
+      .all<{ text_content: string | null }>();
+    for (const m of storedMsgs.results) {
+      expect(m.text_content ?? '').not.toContain('09888777666');
+    }
+
+    // Clear session and send normal AI message; verify Gemini prompt never sees payout number
+    await db.prepare(`DELETE FROM customer_sessions WHERE customer_id = '6502'`).run();
+    let geminiRequestBody = '';
+    globalThis.fetch = vi.fn(async (_url, init) => {
+      geminiRequestBody = String(init?.body ?? '');
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      replyText: 'How can I help you today?',
+                      requiresHumanHandover: false,
+                      ticketCategory: 'NONE',
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as typeof globalThis.fetch;
+
+    await customerService.handleCustomerText(env, {
+      customer: cust,
+      telegramMessageId: 203,
+      updateId: 99203,
+      text: 'What games do you have?',
+      correlationId: 'cor_piiw_3',
+    });
+    expect(geminiRequestBody).not.toContain('09888777666');
+
+    // Verify wd:pii callback rejects SUPER_ADMIN with has_started_bot = 0 before decrypting
+    await db.prepare(`UPDATE admins SET has_started_bot = 0 WHERE telegram_user_id = '9001'`).run();
+    let answerCallbackText = '';
+    globalThis.fetch = vi.fn(async (url, init) => {
+      if (String(url).includes('answerCallbackQuery')) {
+        answerCallbackText = String(init?.body ?? '');
+      }
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    const app = createApp();
+    const cbRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99204,
+          callback_query: {
+            id: 'cb_pii_unstarted',
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            data: encodeCallbackData({ namespace: 'wd', action: 'pii', targetId: 'WD-20261126-ABCDEF1234', version: 1 }),
+          },
+        }),
+      }),
+      env
+    );
+    expect(cbRes.status).toBe(200);
+    expect(answerCallbackText).toContain('@vip_gaming_support_bot');
+    expect(answerCallbackText).toContain('/start');
+  });
+
+  // 24. Full Retention Cron & processed_queue_events Tracking
+  it('24. Enforces all retention windows (messages, unreferenced fingerprints, audit_logs >=301d, sessions, queue events) and records processed_queue_events', async () => {
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '6600',
+      username: 'retuser',
+      firstName: 'RetUser',
+    });
+
+    const nowMs = Date.now();
+    const old200d = nowMs - 200 * 86400000;
+    const old400d = nowMs - 400 * 86400000;
+    const expiredMs = nowMs - 60000;
+
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO messages (message_id, customer_id, direction, sender_role, sender_id, message_type, text_content, is_potential_slip, include_in_ai_context, delivery_status, created_at)
+           VALUES ('msg_old_200d', '6600', 'INBOUND', 'USER', '6600', 'TEXT', 'old msg', 0, 1, 'RECEIVED', ?1)`
+        )
+        .bind(old200d),
+      db
+        .prepare(
+          `INSERT INTO slip_fingerprints (
+             file_unique_id, first_customer_id, first_slip_id, first_ticket_id, first_seen_at,
+             occurrence_count, last_customer_id, last_slip_id, last_seen_at
+           ) VALUES ('FP_OLD_UNREF', '6600', 'slp_old', 'tkt_old', ?1, 1, '6600', 'slp_old', ?1)`
+        )
+        .bind(old400d),
+      db
+        .prepare(
+          `INSERT INTO admin_sessions (admin_id, session_state, expires_at, updated_at)
+           VALUES ('9002', 'IDLE', ?1, ?1)`
+        )
+        .bind(expiredMs),
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_qev_track', 'k_qev_track', 'TEST', 'CUSTOMER', '6600', '6600', '6600_qev', 1, 'sendMessage', '{"chat_id":"6600","text":"Hi"}', 0, 'PENDING', 0, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(nowMs),
+      db
+        .prepare(
+          `INSERT INTO processed_queue_events (event_id, outbox_id, consumer_lease_token, outcome, processed_at, expires_at)
+           VALUES ('qev_expired_1', 'obx_qev_track', 'lt_old', 'COMPLETED', ?1, ?1)`
+        )
+        .bind(expiredMs),
+    ]);
+
+    // Insert an old >365d audit row and verify retention deletes it without violating 300d trigger
+    await auditRepository.appendImmediate(db, {
+      actorId: 'SYSTEM',
+      actorRole: 'SYSTEM',
+      action: 'ANCIENT_AUDIT_EVENT',
+      resourceType: 'SYSTEM',
+      resourceId: 'SYS',
+      result: 'SUCCESS',
+      correlationId: 'cor_old_audit',
+      nowMs: old400d,
+    });
+
+    // Verify outboxConsumer records processed_queue_events
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: 777 } }), { status: 200 })
+    ) as typeof globalThis.fetch;
+    const consRes = await outboxConsumer.processSingleOutbox(env, 'obx_qev_track', 'cor_qev', 'qev_live_1', nowMs);
+    expect(consRes.outcome).toBe('SENT');
+    const trackedQev = await db
+      .prepare(`SELECT outcome FROM processed_queue_events WHERE event_id = 'qev_live_1'`)
+      .first<{ outcome: string }>();
+    expect(trackedQev?.outcome).toBe('COMPLETED');
+
+    const ret = await scheduledDispatcher.runRetentionCron(env, nowMs);
+    expect(ret.expiredMessagesDeleted).toBe(1);
+    expect(ret.expiredFingerprintsDeleted).toBe(1);
+    expect(ret.expiredAdminSessionsDeleted).toBe(1);
+    expect(ret.expiredQueueEventsDeleted).toBe(1);
+    expect(ret.expiredAuditLogsDeleted).toBe(1);
+  });
+
+  // 25. Cloudflare wrangler.jsonc & .env.example Configuration Parity
+  it('25. Verifies wrangler.jsonc staging/production explicit cron triggers and .env.example config parity', () => {
+    const wranglerRaw = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.jsonc'), 'utf8');
+    const wranglerCfg = JSON.parse(wranglerRaw) as {
+      triggers: { crons: string[] };
+      env: {
+        staging: { triggers?: { crons: string[] }; vars: Record<string, string> };
+        production: { triggers?: { crons: string[] }; vars: Record<string, string> };
+      };
+    };
+
+    const expectedCrons = ['* * * * *', '*/5 * * * *', '0 20 * * *'];
+    expect(wranglerCfg.triggers.crons).toEqual(expectedCrons);
+    expect(wranglerCfg.env.staging.triggers?.crons).toEqual(expectedCrons);
+    expect(wranglerCfg.env.production.triggers?.crons).toEqual(expectedCrons);
+
+    // Ensure removed unused SLA env vars are gone
+    expect(wranglerCfg.env.staging.vars).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
+    expect(wranglerCfg.env.staging.vars).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
+
+    // Parse .env.example non-secret vars and verify retention defaults match wrangler.jsonc staging
+    const envExampleRaw = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
+    const envMap: Record<string, string> = {};
+    for (const line of envExampleRaw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed || trimmed.startsWith('#')) continue;
+      const idx = trimmed.indexOf('=');
+      if (idx > 0) {
+        envMap[trimmed.slice(0, idx)] = trimmed.slice(idx + 1);
+      }
+    }
+
+    expect(envMap).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
+    expect(envMap).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
+    expect(envMap.RETENTION_MESSAGES_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_MESSAGES_DAYS);
+    expect(envMap.RETENTION_FINGERPRINTS_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_FINGERPRINTS_DAYS);
+    expect(envMap.RETENTION_AUDIT_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_AUDIT_DAYS);
+    expect(envMap.RETENTION_WITHDRAWAL_PII_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_WITHDRAWAL_PII_DAYS);
+    expect(envMap.RETENTION_OUTBOX_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_OUTBOX_DAYS);
+    // Ensure .env.example uses non-production placeholders rather than fake numeric IDs or candidate handle
+    expect(envMap.TELEGRAM_BOT_USERNAME).toBe('<TELEGRAM_BOT_USERNAME>');
+    expect(envMap.TELEGRAM_ADMIN_GROUP_ID).toBe('<TELEGRAM_ADMIN_GROUP_ID>');
+    expect(envMap.SUPER_ADMIN_IDS).toBe('<SUPER_ADMIN_TELEGRAM_USER_IDS>');
+
+    // Verify DLQ consumer bindings exist for staging and production with max_retries: 0
+    const fullCfg = wranglerCfg as unknown as {
+      env: {
+        staging: { queues: { consumers: Array<{ queue: string; max_retries: number }> } };
+        production: { queues: { consumers: Array<{ queue: string; max_retries: number }> } };
+      };
+    };
+    const stagingDlq = fullCfg.env.staging.queues.consumers.find((c) => c.queue === 'vip-outbox-dlq-staging');
+    const prodDlq = fullCfg.env.production.queues.consumers.find((c) => c.queue === 'vip-outbox-dlq-prod');
+    expect(stagingDlq).toBeDefined();
+    expect(stagingDlq!.max_retries).toBe(0);
+    expect(prodDlq).toBeDefined();
+    expect(prodDlq!.max_retries).toBe(0);
+  });
+
+  // 26. F-01: Bootstrap SUPER_ADMIN starts with has_started_bot = 0 and activates via private /start [payload]
+  it('26. F-01: Bootstraps SUPER_ADMIN with has_started_bot=0, blocks claim/PII until private /start [payload], and preserves flag on re-bootstrap', async () => {
+    const app = createApp();
+    const envWithNewSuper: Env = { ...env, SUPER_ADMIN_IDS: '9001,9990' };
+
+    await adminService.ensureBootstrapSuperAdmins(envWithNewSuper);
+    const bootstrapped = await adminRepository.getById(db, '9990');
+    expect(bootstrapped).not.toBeNull();
+    expect(bootstrapped!.role).toBe('SUPER_ADMIN');
+    expect(bootstrapped!.has_started_bot).toBe(0);
+    expect(bootstrapped!.last_seen_at).toBeNull();
+
+    // Unstarted SUPER_ADMIN cannot claim ticket
+    await customerService.ensureActiveCustomer(envWithNewSuper, {
+      customerId: '7101',
+      username: 'u7101',
+      firstName: 'U7101',
+    });
+    const { ticket } = await handoverService.escalateCustomerToHuman(envWithNewSuper, {
+      customerId: '7101',
+      customerFirstName: 'U7101',
+      customerUsername: 'u7101',
+      ticketType: 'GENERAL_SUPPORT',
+      summaryText: 'Help',
+      reason: 'Test',
+      correlationId: 'cor_f01_tkt',
+    });
+    await expect(
+      handoverService.takeOverTicket(envWithNewSuper, {
+        adminId: '9990',
+        ticketId: ticket.ticket_id,
+        expectedVersion: 1,
+        correlationId: 'cor_f01_claim_fail',
+      })
+    ).rejects.toThrow(/\/start/i);
+
+    // Send /start with deep-link payload in private chat -> sets has_started_bot = 1
+    const startRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99301,
+          message: {
+            message_id: 1,
+            date: 1700000000,
+            chat: { id: 9990, type: 'private' },
+            from: { id: 9990, is_bot: false, first_name: 'BootstrapSA' },
+            text: '/start onboarding_ref',
+          },
+        }),
+      }),
+      envWithNewSuper
+    );
+    expect(startRes.status).toBe(200);
+
+    const afterStart = await adminRepository.getById(db, '9990');
+    expect(afterStart!.has_started_bot).toBe(1);
+    expect(afterStart!.last_seen_at).not.toBeNull();
+
+    // Re-running upsertBootstrapSuperAdmin preserves has_started_bot = 1
+    await adminRepository.upsertBootstrapSuperAdmin(db, '9990', 'BootstrapSA', 'tok_reboot', Date.now());
+    const afterReboot = await adminRepository.getById(db, '9990');
+    expect(afterReboot!.has_started_bot).toBe(1);
+  });
+
+  // 27. F-02: Admin webhook command domain/auth errors return HTTP 200 (no poison retry loop)
+  it('27. F-02: Returns HTTP 200 and marks processed_updates COMPLETED when admin commands fail auth/validation/not-found', async () => {
+    const app = createApp();
+    const commands = [
+      { updateId: 99401, fromId: 9002, text: '/toggle_ai' },
+      { updateId: 99402, fromId: 9002, text: '/approve_dep DEP-20261126-MISSING001 1 REF1' },
+      { updateId: 99403, fromId: 9002, text: '/paid_wd WD-20261126-MISSING001 1 PAY1' },
+      { updateId: 99404, fromId: 9002, text: '/view_wd_pii WD-20261126-MISSING001' },
+      { updateId: 99405, fromId: 9001, text: '/approve_dep DEP-20261126-MISSING001 1 REF1' },
+    ];
+
+    for (const cmd of commands) {
+      const res = await app.fetch(
+        new Request('https://bot.example/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify({
+            update_id: cmd.updateId,
+            message: {
+              message_id: cmd.updateId,
+              date: 1700000000,
+              chat: { id: cmd.fromId, type: 'private' },
+              from: { id: cmd.fromId, is_bot: false, first_name: 'Admin' },
+              text: cmd.text,
+            },
+          }),
+        }),
+        env
+      );
+      expect(res.status).toBe(200);
+      const upd = await db
+        .prepare('SELECT status FROM processed_updates WHERE update_id = ?1')
+        .bind(cmd.updateId)
+        .first<{ status: string }>();
+      expect(upd!.status).toBe('COMPLETED');
+    }
+
+    // RBAC-before-lookup: SUPPORT_AGENT got DENIED audit even on non-existent deposit/withdrawal IDs
+    const denied = await db
+      .prepare(`SELECT action FROM audit_logs WHERE actor_id = '9002' AND result = 'DENIED'`)
+      .all<{ action: string }>();
+    const actions = denied.results.map((r) => r.action);
+    expect(actions).toContain('UNAUTHORIZED_CONFIG_TOGGLE_AI_ATTEMPT');
+    expect(actions).toContain('UNAUTHORIZED_DEPOSIT_DECISION_ATTEMPT');
+    expect(actions).toContain('UNAUTHORIZED_WITHDRAWAL_DECISION_ATTEMPT');
+    expect(actions).toContain('UNAUTHORIZED_WITHDRAWAL_PII_DECRYPT_ATTEMPT');
+  });
+
+  // 28. F-03: End-to-End Admin Private Console Card, Callbacks (tk:reply, dep:app/rej/info, wd:rev/app/paid/rej/info), Admin Sessions, & /cancel
+  it('28. F-03: Delivers private console on claim and executes tk:reply, deposit/withdrawal callbacks, admin sessions, and /cancel end-to-end', async () => {
+    const app = createApp();
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 })) as typeof globalThis.fetch;
+
+    const postWebhook = async (body: Record<string, unknown>) =>
+      app.fetch(
+        new Request('https://bot.example/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify(body),
+        }),
+        env
+      );
+
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '7201',
+      username: 'u7201',
+      firstName: 'ConsoleCustomer',
+      languageCode: 'en',
+    });
+
+    // Customer submits deposit + withdrawal
+    const depDraft = await depositService.startDepositWizard(env, '7201');
+    await depositService.handleAmountInput(env, '7201', '25000');
+    await depositService.handleMethodSelection(env, '7201', 'KBZPAY');
+    await depositService.handleReferenceInput(env, '7201', 'DEP-CB-REF-1');
+    const { deposit } = await depositService.confirmSubmission(env, {
+      customerId: '7201',
+      draftToken: depDraft.draftToken,
+      correlationId: 'cor_f03_dep',
+    });
+
+    const wdDraft = await withdrawalService.startWithdrawalWizard(env, '7201');
+    await withdrawalService.handleAmountInput(env, '7201', '15000');
+    await withdrawalService.handleMethodSelection(env, '7201', 'KBZPAY');
+    await withdrawalService.handleDestinationInput(env, '7201', 'U Mg Mg - 09450001122');
+    const { withdrawal } = await withdrawalService.confirmSubmission(env, {
+      customerId: '7201',
+      draftToken: wdDraft.draftToken,
+      correlationId: 'cor_f03_wd',
+    });
+
+    // SUPER_ADMIN claims ticket -> private console card sent to 9001
+    expect(
+      (
+        await postWebhook({
+          update_id: 99501,
+          callback_query: {
+            id: 'cb_f03_claim',
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            data: encodeCallbackData({ namespace: 'tk', action: 'claim', targetId: deposit.ticket_id, version: 1 }),
+          },
+        })
+      ).status
+    ).toBe(200);
+
+    const consoleOutbox = await db
+      .prepare(`SELECT payload_json FROM outbox WHERE target_chat_id = '9001' AND event_type = 'ADMIN_PRIVATE_CONSOLE'`)
+      .first<{ payload_json: string }>();
+    expect(consoleOutbox).not.toBeNull();
+    expect(consoleOutbox!.payload_json).toContain('wd:rev:');
+    expect(consoleOutbox!.payload_json).toContain('dep:app:');
+
+    // tk:reply callback -> admin private text sends reply to customer
+    expect(
+      (
+        await postWebhook({
+          update_id: 99502,
+          callback_query: {
+            id: 'cb_f03_reply',
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            data: encodeCallbackData({ namespace: 'tk', action: 'reply', targetId: deposit.ticket_id, version: 2 }),
+          },
+        })
+      ).status
+    ).toBe(200);
+    expect(
+      (
+        await postWebhook({
+          update_id: 99503,
+          message: {
+            message_id: 503,
+            date: 1700000000,
+            chat: { id: 9001, type: 'private' },
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            text: 'We are reviewing your requests now.',
+          },
+        })
+      ).status
+    ).toBe(200);
+
+    const adminReplyOutbox = await db
+      .prepare(`SELECT payload_json FROM outbox WHERE target_chat_id = '7201' AND event_type = 'ADMIN_REPLY'`)
+      .first<{ payload_json: string }>();
+    expect(adminReplyOutbox!.payload_json).toContain('We are reviewing your requests now.');
+
+    // SUPPORT_AGENT (9002) blocked from dep:app and audited DENIED
+    await postWebhook({
+      update_id: 99504,
+      callback_query: {
+        id: 'cb_f03_dep_denied',
+        from: { id: 9002, is_bot: false, first_name: 'Agent' },
+        data: encodeCallbackData({ namespace: 'dep', action: 'app', targetId: deposit.deposit_id, version: 1 }),
+      },
+    });
+    const depDenied = await db
+      .prepare(`SELECT action FROM audit_logs WHERE actor_id = '9002' AND action = 'UNAUTHORIZED_DEPOSIT_CALLBACK_ATTEMPT'`)
+      .first<{ action: string }>();
+    expect(depDenied).not.toBeNull();
+
+    // SUPER_ADMIN clicks dep:app -> submits evidence ref in DM -> APPROVED_MANUAL_CREDITED
+    await postWebhook({
+      update_id: 99505,
+      callback_query: {
+        id: 'cb_f03_dep_app',
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        data: encodeCallbackData({ namespace: 'dep', action: 'app', targetId: deposit.deposit_id, version: 1 }),
+      },
+    });
+    await postWebhook({
+      update_id: 99506,
+      message: {
+        message_id: 506,
+        date: 1700000000,
+        chat: { id: 9001, type: 'private' },
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        text: 'MANUAL-CRED-EVID-777',
+      },
+    });
+    const depFinal = await db
+      .prepare('SELECT status, admin_operation_evidence_ref FROM deposit_requests WHERE deposit_id = ?1')
+      .bind(deposit.deposit_id)
+      .first<{ status: string; admin_operation_evidence_ref: string }>();
+    expect(depFinal!.status).toBe('APPROVED_MANUAL_CREDITED');
+    expect(depFinal!.admin_operation_evidence_ref).toBe('MANUAL-CRED-EVID-777');
+
+    // SUPER_ADMIN runs strict withdrawal callback sequence: wd:rev -> wd:app -> wd:paid + DM evidence ref
+    await postWebhook({
+      update_id: 99507,
+      callback_query: {
+        id: 'cb_f03_wd_rev',
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        data: encodeCallbackData({ namespace: 'wd', action: 'rev', targetId: withdrawal.withdrawal_id, version: 1 }),
+      },
+    });
+    await postWebhook({
+      update_id: 99508,
+      callback_query: {
+        id: 'cb_f03_wd_app',
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        data: encodeCallbackData({ namespace: 'wd', action: 'app', targetId: withdrawal.withdrawal_id, version: 2 }),
+      },
+    });
+
+    // Verify APPROVED_FOR_PAYOUT notice explicitly distinguishes from PAID_RECORDED
+    const appNotice = await db
+      .prepare(`SELECT payload_json FROM outbox WHERE event_type = 'WITHDRAWAL_APPROVED_FOR_PAYOUT' AND aggregate_id = ?1`)
+      .bind(withdrawal.withdrawal_id)
+      .first<{ payload_json: string }>();
+    expect(appNotice).not.toBeNull();
+    expect(appNotice!.payload_json).toContain('NOT been completed yet');
+
+    // Trigger wd:paid, test /cancel clears session, then re-trigger wd:paid and submit evidence
+    await postWebhook({
+      update_id: 99509,
+      callback_query: {
+        id: 'cb_f03_wd_paid_1',
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        data: encodeCallbackData({ namespace: 'wd', action: 'paid', targetId: withdrawal.withdrawal_id, version: 3 }),
+      },
+    });
+    await postWebhook({
+      update_id: 99510,
+      message: {
+        message_id: 510,
+        date: 1700000000,
+        chat: { id: 9001, type: 'private' },
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        text: '/cancel',
+      },
+    });
+    expect(await adminRepository.getSession(db, '9001')).toBeNull();
+
+    await postWebhook({
+      update_id: 99511,
+      callback_query: {
+        id: 'cb_f03_wd_paid_2',
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        data: encodeCallbackData({ namespace: 'wd', action: 'paid', targetId: withdrawal.withdrawal_id, version: 3 }),
+      },
+    });
+    await postWebhook({
+      update_id: 99512,
+      message: {
+        message_id: 512,
+        date: 1700000000,
+        chat: { id: 9001, type: 'private' },
+        from: { id: 9001, is_bot: false, first_name: 'Super' },
+        text: 'KBZ-EXT-PAYOUT-999',
+      },
+    });
+    const wdFinal = await db
+      .prepare('SELECT status, payment_evidence_ref FROM withdrawal_requests WHERE withdrawal_id = ?1')
+      .bind(withdrawal.withdrawal_id)
+      .first<{ status: string; payment_evidence_ref: string }>();
+    expect(wdFinal!.status).toBe('PAID_RECORDED');
+    expect(wdFinal!.payment_evidence_ref).toBe('KBZ-EXT-PAYOUT-999');
+  });
+
+  // 29. F-03: Customer Cancellation (dep:creq, wd:creq) & NEEDS_INFO Customer Reply (dep:rinfo, wd:rinfo)
+  it('29. F-03: Supports idempotent customer cancellation and NEEDS_INFO reply sessions with anti-secret protection and include_in_ai_context=0', async () => {
+    const app = createApp();
+    globalThis.fetch = vi.fn(async () => new Response(JSON.stringify({ ok: true, result: true }), { status: 200 })) as typeof globalThis.fetch;
+
+    const postWebhook = async (body: Record<string, unknown>) =>
+      app.fetch(
+        new Request('https://bot.example/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify(body),
+        }),
+        env
+      );
+
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '7301',
+      username: 'u7301',
+      firstName: 'CancelUser',
+      languageCode: 'en',
+    });
+
+    // Deposit cancellation via dep:creq (idempotent on repeat)
+    const dDraft = await depositService.startDepositWizard(env, '7301');
+    await depositService.handleAmountInput(env, '7301', '12000');
+    await depositService.handleMethodSelection(env, '7301', 'KBZPAY');
+    await depositService.handleReferenceInput(env, '7301', 'CNCL-REF-1');
+    const { deposit } = await depositService.confirmSubmission(env, {
+      customerId: '7301',
+      draftToken: dDraft.draftToken,
+      correlationId: 'cor_cncl_d1',
+    });
+
+    await postWebhook({
+      update_id: 99601,
+      callback_query: {
+        id: 'cb_dep_creq_1',
+        from: { id: 7301, is_bot: false, first_name: 'CancelUser' },
+        data: encodeCallbackData({ namespace: 'dep', action: 'creq', targetId: deposit.deposit_id, version: 1 }),
+      },
+    });
+    // Repeat click is idempotent
+    await postWebhook({
+      update_id: 99602,
+      callback_query: {
+        id: 'cb_dep_creq_2',
+        from: { id: 7301, is_bot: false, first_name: 'CancelUser' },
+        data: encodeCallbackData({ namespace: 'dep', action: 'creq', targetId: deposit.deposit_id, version: 1 }),
+      },
+    });
+    const depRow = await db
+      .prepare('SELECT status FROM deposit_requests WHERE deposit_id = ?1')
+      .bind(deposit.deposit_id)
+      .first<{ status: string }>();
+    expect(depRow!.status).toBe('CANCELLED_BY_CUSTOMER');
+
+    // Withdrawal NEEDS_INFO -> customer clicks wd:rinfo -> rejects OTP -> accepts safe reply -> include_in_ai_context=0
+    const wDraft = await withdrawalService.startWithdrawalWizard(env, '7301');
+    await withdrawalService.handleAmountInput(env, '7301', '18000');
+    await withdrawalService.handleMethodSelection(env, '7301', 'KBZPAY');
+    await withdrawalService.handleDestinationInput(env, '7301', 'U Aung - 09451112233');
+    const { withdrawal } = await withdrawalService.confirmSubmission(env, {
+      customerId: '7301',
+      draftToken: wDraft.draftToken,
+      correlationId: 'cor_ninfo_w1',
+    });
+
+    await withdrawalService.submitSuperAdminDecision(env, {
+      adminId: '9001',
+      withdrawalId: withdrawal.withdrawal_id,
+      newStatus: 'UNDER_REVIEW',
+      expectedVersion: 1,
+      correlationId: 'cor_ninfo_rev',
+    });
+    await withdrawalService.submitSuperAdminDecision(env, {
+      adminId: '9001',
+      withdrawalId: withdrawal.withdrawal_id,
+      newStatus: 'NEEDS_INFO',
+      decisionNote: 'Please confirm account holder full name',
+      expectedVersion: 2,
+      correlationId: 'cor_ninfo_req',
+    });
+
+    await postWebhook({
+      update_id: 99603,
+      callback_query: {
+        id: 'cb_wd_rinfo',
+        from: { id: 7301, is_bot: false, first_name: 'CancelUser' },
+        data: encodeCallbackData({ namespace: 'wd', action: 'rinfo', targetId: withdrawal.withdrawal_id, version: 3 }),
+      },
+    });
+
+    // Attempt with OTP is rejected and session stays open
+    await postWebhook({
+      update_id: 99604,
+      message: {
+        message_id: 604,
+        date: 1700000000,
+        chat: { id: 7301, type: 'private' },
+        from: { id: 7301, is_bot: false, first_name: 'CancelUser' },
+        text: 'My OTP is 123456',
+      },
+    });
+    const sessStillOpen = await db
+      .prepare(`SELECT wizard_type FROM customer_sessions WHERE customer_id = '7301'`)
+      .first<{ wizard_type: string }>();
+    expect(sessStillOpen!.wizard_type).toBe('NEEDS_INFO_REPLY');
+
+    // Valid reply clears session and stores message with include_in_ai_context = 0
+    await postWebhook({
+      update_id: 99605,
+      message: {
+        message_id: 605,
+        date: 1700000000,
+        chat: { id: 7301, type: 'private' },
+        from: { id: 7301, is_bot: false, first_name: 'CancelUser' },
+        text: 'Account holder full name is U Aung Kyaw.',
+      },
+    });
+    const sessCleared = await db
+      .prepare(`SELECT * FROM customer_sessions WHERE customer_id = '7301'`)
+      .first();
+    expect(sessCleared).toBeNull();
+
+    const replyMsg = await db
+      .prepare(`SELECT text_content, include_in_ai_context FROM messages WHERE customer_id = '7301' AND update_id = 99605`)
+      .first<{ text_content: string; include_in_ai_context: number }>();
+    expect(replyMsg!.text_content).toBe('Account holder full name is U Aung Kyaw.');
+    expect(replyMsg!.include_in_ai_context).toBe(0);
+  });
+
+  // 30. F-04: Strict 32-byte AES Key Validation & Strict Key Version Selection
+  it('30. F-04: Rejects placeholder, weak, short, or malformed AES keys and forbids unsafe currentKey fallback on missing previousKey', async () => {
+    expect(() => parseAes256KeyBytes('CONFIGURED_IN_CLOUDFLARE_ENV')).toThrow(/placeholder/i);
+    expect(() => parseAes256KeyBytes('PENDING_OWNER_CONFIGURATION')).toThrow(/placeholder/i);
+    expect(() => parseAes256KeyBytes('short_key')).toThrow();
+    expect(() => parseAes256KeyBytes('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=')).toThrow(/entropy/i);
+    expect(parseAes256KeyBytes('000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f')).toHaveLength(32);
+
+    const enc = await encryptPayoutDestination('U Test - 09123456789', TEST_AES_KEY_V1, {
+      purpose: 'withdrawal_destination',
+      customerId: '7401',
+      recordToken: 'wdt_f04_1',
+      methodCode: 'KBZPAY',
+      keyVersion: 1,
+    });
+
+    // Missing previousKey when decrypting currentKeyVersion - 1 throws DECRYPTION_KEY_UNAVAILABLE
+    await expect(
+      decryptPayoutDestination(
+        enc.ciphertext,
+        enc.iv,
+        {
+          purpose: 'withdrawal_destination',
+          customerId: '7401',
+          recordToken: 'wdt_f04_1',
+          methodCode: 'KBZPAY',
+          keyVersion: 1,
+        },
+        { currentKey: TEST_AES_KEY_V2, previousKey: undefined, currentKeyVersion: 2 }
+      )
+    ).rejects.toThrow(/DECRYPTION_KEY_UNAVAILABLE/);
+
+    // Unsupported older keyVersion throws UNSUPPORTED_ENCRYPTION_KEY_VERSION
+    await expect(
+      decryptPayoutDestination(
+        enc.ciphertext,
+        enc.iv,
+        {
+          purpose: 'withdrawal_destination',
+          customerId: '7401',
+          recordToken: 'wdt_f04_1',
+          methodCode: 'KBZPAY',
+          keyVersion: 1,
+        },
+        { currentKey: TEST_AES_KEY_V2, previousKey: TEST_AES_KEY_V1, currentKeyVersion: 3 }
+      )
+    ).rejects.toThrow(/UNSUPPORTED_ENCRYPTION_KEY_VERSION/);
+  });
+
+  // 31. F-05: AI-to-HUMAN Race Produces Zero AI Messages, Zero Outbox Rows, and Zero Queue Signals
+  it('31. F-05: Suppresses AI messages, outbox rows, and queue dispatches atomically if customer switches to HUMAN during Gemini latency', async () => {
+    await db.prepare(`UPDATE config SET ai_enabled = 1 WHERE config_id = 'active'`).run();
+    const cust = await customerService.ensureActiveCustomer(env, {
+      customerId: '7501',
+      username: 'raceu',
+      firstName: 'RaceUser',
+    });
+
+    enqueuedPayloads.length = 0;
+
+    globalThis.fetch = vi.fn(async () => {
+      // Simulate concurrent escalation switching customer to HUMAN mode while Gemini call is in flight
+      await db
+        .prepare(`UPDATE customers SET chat_mode = 'HUMAN' WHERE telegram_user_id = '7501'`)
+        .run();
+
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [
+                  {
+                    text: JSON.stringify({
+                      replyText: 'Late AI reply that must be suppressed!',
+                      requiresHumanHandover: false,
+                      ticketCategory: 'NONE',
+                    }),
+                  },
+                ],
+              },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }) as typeof globalThis.fetch;
+
+    await customerService.handleCustomerText(env, {
+      customer: cust,
+      telegramMessageId: 7501,
+      updateId: 99701,
+      text: 'How do bonuses work?',
+      correlationId: 'cor_f05_race',
+    });
+
+    const aiMessages = await db
+      .prepare(`SELECT * FROM messages WHERE customer_id = '7501' AND sender_role = 'MODEL'`)
+      .all();
+    expect(aiMessages.results).toHaveLength(0);
+
+    const aiOutbox = await db
+      .prepare(`SELECT * FROM outbox WHERE target_chat_id = '7501' AND event_type = 'AI_AUTO_REPLY'`)
+      .all();
+    expect(aiOutbox.results).toHaveLength(0);
+    expect(enqueuedPayloads).toHaveLength(0);
+  });
+
+  // 32. F-06: Transport Error DELIVERY_UNCERTAIN, Lease-Fenced Completion, Pre-Claim Queue Dedup, & Explicit DLQ Consumer
+  it('32. F-06: Marks non-idempotent transport errors DELIVERY_UNCERTAIN, prevents stale lease overwrite, deduplicates queue events, and handles DLQ safely', async () => {
+    const nowMs = Date.now();
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '7601',
+      username: 'f06u',
+      firstName: 'F06User',
+    });
+
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_net_err', 'k_net_err', 'TEST', 'CUSTOMER', '7601', '7601', '7601_a', 1, 'sendMessage', '{"chat_id":"7601","text":"NetErr"}', 0, 'PENDING', 0, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(nowMs),
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_dedup_qev', 'k_dedup_qev', 'TEST', 'CUSTOMER', '7601', '7601', '7601_b', 1, 'sendMessage', '{"chat_id":"7601","text":"Dedup"}', 0, 'PENDING', 0, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(nowMs),
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, lease_owner, lease_token, lease_expires_at, created_at, updated_at)
+           VALUES ('obx_lease_race', 'k_lease_race', 'TEST', 'CUSTOMER', '7601', '7601', '7601_c', 1, 'sendMessage', '{"chat_id":"7601","text":"Race"}', 0, 'SENDING', 1, 6, ?1, ?1, 'w1', 'lt_old_token', ?2, ?1, ?1)`
+        )
+        .bind(nowMs, nowMs - 10000),
+    ]);
+
+    // 1. Generic network transport exception (non-timeout TypeError) -> DELIVERY_UNCERTAIN (never auto-retry)
+    globalThis.fetch = vi.fn(async () => {
+      throw new TypeError('fetch failed: connection reset by peer');
+    }) as typeof globalThis.fetch;
+    expect((await outboxConsumer.processSingleOutbox(env, 'obx_net_err', 'cor_net', 'qev_net_1', nowMs)).outcome).toBe(
+      'DELIVERY_UNCERTAIN'
+    );
+
+    // 2. Lease-fenced completion: Cron marks expired SENDING as DELIVERY_UNCERTAIN -> stale worker markSent returns false & does not overwrite
+    await scheduledDispatcher.runLeaseRecoveryCron(env, nowMs);
+    const raceRow = (await outboxRepository.getById(db, 'obx_lease_race'))!;
+    expect(raceRow.status).toBe('DELIVERY_UNCERTAIN');
+    const staleOverwrite = await outboxRepository.markSent(db, {
+      outbox: raceRow,
+      leaseToken: 'lt_old_token',
+      telegramMessageId: 999,
+      nowMs: nowMs + 100,
+    });
+    expect(staleOverwrite).toBe(false);
+    expect((await outboxRepository.getById(db, 'obx_lease_race'))!.status).toBe('DELIVERY_UNCERTAIN');
+
+    // 3. Pre-claim processed_queue_events guard skips duplicate queue eventId
+    let sendCalls = 0;
+    globalThis.fetch = vi.fn(async () => {
+      sendCalls++;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 888 } }), { status: 200 });
+    }) as typeof globalThis.fetch;
+    expect((await outboxConsumer.processSingleOutbox(env, 'obx_dedup_qev', 'cor_dq', 'qev_same_id', nowMs)).outcome).toBe('SENT');
+    expect((await outboxConsumer.processSingleOutbox(env, 'obx_dedup_qev', 'cor_dq', 'qev_same_id', nowMs + 1)).outcome).toBe('SKIPPED');
+    expect(sendCalls).toBe(1);
+
+    // 4. Explicit DLQ consumer handler records audit, alerts started SUPER_ADMIN, acks without auto-replay
+    let acked = false;
+    await workerEntry.queue(
+      {
+        queue: 'vip-outbox-dlq-staging',
+        messages: [
+          {
+            id: 'dlq_msg_1',
+            timestamp: new Date(nowMs),
+            attempts: 3,
+            body: {
+              eventId: 'qev_dlq_1',
+              outboxId: 'obx_net_err',
+              orderingKey: '7601_a',
+              sequenceNo: 1,
+              correlationId: 'cor_dlq_1',
+            },
+            ack: () => {
+              acked = true;
+            },
+            retry: () => {
+              throw new Error('DLQ must not retry');
+            },
+          },
+        ],
+        ackAll: () => {
+          acked = true;
+        },
+        retryAll: () => {
+          throw new Error('DLQ must not retry');
+        },
+      },
+      env,
+      { waitUntil() {}, passThroughOnException() {}, props: {} }
+    );
+    expect(acked).toBe(true);
+    const dlqAudit = await db
+      .prepare(`SELECT action FROM audit_logs WHERE resource_id = 'obx_net_err' AND action = 'OUTBOX_DLQ_EVENT_RECORDED'`)
+      .first<{ action: string }>();
+    expect(dlqAudit).not.toBeNull();
+    const dlqAlert = await db
+      .prepare(`SELECT target_chat_id FROM outbox WHERE event_type = 'DLQ_ALERT' AND aggregate_id = 'obx_net_err'`)
+      .first<{ target_chat_id: string }>();
+    expect(dlqAlert!.target_chat_id).toBe('9001');
+  });
+
+  // 33. F-07: Fork-Free Audit Chain Concurrency, Checkpointed Retention, & Terminal Outbox Pruning
+  it('33. F-07: Prevents audit chain forks, preserves chain verification across checkpointed retention, and prunes only old terminal outbox rows', async () => {
+    const nowMs = Date.now();
+    const old400d = nowMs - 400 * 86400000;
+    const old60d = nowMs - 60 * 86400000;
+
+    // Seed 2 ancient audit rows (>365d) and 2 recent audit rows concurrently
+    await auditRepository.appendImmediate(db, {
+      actorId: 'SYS',
+      actorRole: 'SYSTEM',
+      action: 'OLD_EVT_1',
+      resourceType: 'SYSTEM',
+      resourceId: 'R1',
+      result: 'SUCCESS',
+      correlationId: 'cor_old_1',
+      nowMs: old400d,
+    });
+    await auditRepository.appendImmediate(db, {
+      actorId: 'SYS',
+      actorRole: 'SYSTEM',
+      action: 'OLD_EVT_2',
+      resourceType: 'SYSTEM',
+      resourceId: 'R2',
+      result: 'SUCCESS',
+      correlationId: 'cor_old_2',
+      nowMs: old400d + 1000,
+    });
+
+    // Concurrent appends serialize cleanly on UNIQUE(prev_entry_hash) without forking
+    await Promise.all([
+      auditRepository.appendImmediate(db, {
+        actorId: 'SYS',
+        actorRole: 'SYSTEM',
+        action: 'CONC_EVT_1',
+        resourceType: 'SYSTEM',
+        resourceId: 'C1',
+        result: 'SUCCESS',
+        correlationId: 'cor_c1',
+        nowMs,
+      }),
+      auditRepository.appendImmediate(db, {
+        actorId: 'SYS',
+        actorRole: 'SYSTEM',
+        action: 'CONC_EVT_2',
+        resourceType: 'SYSTEM',
+        resourceId: 'C2',
+        result: 'SUCCESS',
+        correlationId: 'cor_c2',
+        nowMs: nowMs + 1,
+      }),
+    ]);
+
+    expect((await auditRepository.verifyChainIntegrity(db)).valid).toBe(true);
+
+    // Seed terminal SENT/PERMANENT_FAILURE outbox rows (>30d) + PENDING & DELIVERY_UNCERTAIN rows (>30d)
+    await db.batch([
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_old_sent', 'k_os', 'TEST', 'SYSTEM', 'S', '9001', 'o1', 1, 'sendMessage', '{}', 0, 'SENT', 1, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(old60d),
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_old_perm', 'k_op', 'TEST', 'SYSTEM', 'S', '9001', 'o2', 1, 'sendMessage', '{}', 0, 'PERMANENT_FAILURE', 1, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(old60d),
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_old_unc', 'k_ou', 'TEST', 'SYSTEM', 'S', '9001', 'o3', 1, 'sendMessage', '{}', 0, 'DELIVERY_UNCERTAIN', 1, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(old60d),
+      db
+        .prepare(
+          `INSERT INTO outbox (outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id, target_chat_id, ordering_key, sequence_no, telegram_method, payload_json, is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at)
+           VALUES ('obx_old_pend', 'k_opd', 'TEST', 'SYSTEM', 'S', '9001', 'o4', 1, 'sendMessage', '{}', 0, 'PENDING', 0, 6, ?1, ?1, ?1, ?1)`
+        )
+        .bind(old60d),
+    ]);
+
+    const ret = await scheduledDispatcher.runRetentionCron(env, nowMs);
+    expect(ret.expiredOutboxDeleted).toBe(2);
+    expect(ret.expiredAuditLogsDeleted).toBe(2);
+    expect(ret.auditCheckpointId).not.toBeNull();
+
+    // Non-terminal & DELIVERY_UNCERTAIN outbox rows are preserved
+    expect(await outboxRepository.getById(db, 'obx_old_sent')).toBeNull();
+    expect(await outboxRepository.getById(db, 'obx_old_perm')).toBeNull();
+    expect(await outboxRepository.getById(db, 'obx_old_unc')).not.toBeNull();
+    expect(await outboxRepository.getById(db, 'obx_old_pend')).not.toBeNull();
+
+    // Chain integrity STILL passes across checkpoint + retained logs!
+    const postRetentionChain = await auditRepository.verifyChainIntegrity(db);
+    expect(postRetentionChain.valid).toBe(true);
+    expect(postRetentionChain.checkpointCount).toBe(1);
+
+    // Checkpoint rows are immutable via SQLite triggers
+    await expect(
+      db.prepare(`UPDATE audit_retention_checkpoints SET purged_count = 999`).run()
+    ).rejects.toThrow(/AUDIT_CHECKPOINTS_IMMUTABLE/i);
+    await expect(
+      db.prepare(`DELETE FROM audit_retention_checkpoints`).run()
+    ).rejects.toThrow(/AUDIT_CHECKPOINTS_IMMUTABLE/i);
+  });
+
+  // 34. F-08: BANNED Customers Strictly Blocked Across Messages, /start, Photos, and Callbacks
+  it('34. F-08: Immediately blocks BANNED customers across /start, text, photo, and callbacks with zero side effects', async () => {
+    const app = createApp();
+    await db.prepare(`UPDATE config SET ai_enabled = 1 WHERE config_id = 'active'`).run();
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '7801',
+      username: 'bannedu',
+      firstName: 'BannedUser',
+    });
+    await db.prepare(`UPDATE customers SET account_status = 'BANNED' WHERE telegram_user_id = '7801'`).run();
+
+    let geminiCalled = false;
+    globalThis.fetch = vi.fn(async (url) => {
+      if (String(url).includes('generativelanguage')) geminiCalled = true;
+      return new Response(JSON.stringify({ ok: true, result: true }), { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    const send = (body: Record<string, unknown>) =>
+      app.fetch(
+        new Request('https://bot.example/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+          },
+          body: JSON.stringify(body),
+        }),
+        env
+      );
+
+    expect(
+      (
+        await send({
+          update_id: 99801,
+          message: {
+            message_id: 1,
+            date: 1700000000,
+            chat: { id: 7801, type: 'private' },
+            from: { id: 7801, is_bot: false, first_name: 'BannedUser' },
+            text: '/start',
+          },
+        })
+      ).status
+    ).toBe(200);
+
+    expect(
+      (
+        await send({
+          update_id: 99802,
+          message: {
+            message_id: 2,
+            date: 1700000000,
+            chat: { id: 7801, type: 'private' },
+            from: { id: 7801, is_bot: false, first_name: 'BannedUser' },
+            text: 'Hello bot answer me',
+          },
+        })
+      ).status
+    ).toBe(200);
+
+    expect(
+      (
+        await send({
+          update_id: 99803,
+          message: {
+            message_id: 3,
+            date: 1700000000,
+            chat: { id: 7801, type: 'private' },
+            from: { id: 7801, is_bot: false, first_name: 'BannedUser' },
+            photo: [{ file_id: 'f1', file_unique_id: 'fu_ban', width: 100, height: 100 }],
+          },
+        })
+      ).status
+    ).toBe(200);
+
+    expect(
+      (
+        await send({
+          update_id: 99804,
+          callback_query: {
+            id: 'cb_ban_1',
+            from: { id: 7801, is_bot: false, first_name: 'BannedUser' },
+            data: encodeCallbackData({ namespace: 'mnu', action: 'open', targetId: 'WITHDRAW' }),
+          },
+        })
+      ).status
+    ).toBe(200);
+
+    expect(geminiCalled).toBe(false);
+    const outboxCount = (await db.prepare(`SELECT COUNT(*) as c FROM outbox WHERE target_chat_id = '7801'`).first<{ c: number }>())!.c;
+    const ticketCount = (await db.prepare(`SELECT COUNT(*) as c FROM support_tickets WHERE customer_id = '7801'`).first<{ c: number }>())!.c;
+    const slipCount = (await db.prepare(`SELECT COUNT(*) as c FROM slip_reviews WHERE customer_id = '7801'`).first<{ c: number }>())!.c;
+    expect(outboxCount).toBe(0);
+    expect(ticketCount).toBe(0);
+    expect(slipCount).toBe(0);
+  });
+
+  // 35. F-09 & F-10: HTML Escaping, Bootstrap ai_enabled=0, FAQ Config Snapshot, & Group Migration Handling
+  it('35. F-09 & F-10: Escapes all HTML metacharacters, boots with ai_enabled=0 and populated FAQ snapshot, and audits migrate_to_chat_id', async () => {
+    expect(escapeHtml(`<a href="x">& 'test'</a>`)).toBe('&lt;a href=&quot;x&quot;&gt;&amp; &#39;test&#39;&lt;/a&gt;');
+
+    // Migration 0004 aligned bootstrap config to ai_enabled = 0 and populated config_versions v1 faq_snapshot_json
+    const cfg = await db
+      .prepare(`SELECT ai_enabled FROM config WHERE config_id = 'active'`)
+      .first<{ ai_enabled: number }>();
+    expect(cfg!.ai_enabled).toBe(0);
+
+    const v1Snap = await db
+      .prepare(`SELECT ai_enabled, faq_snapshot_json FROM config_versions WHERE version_number = 1`)
+      .first<{ ai_enabled: number; faq_snapshot_json: string }>();
+    expect(v1Snap!.ai_enabled).toBe(0);
+    const parsedFaqs = JSON.parse(v1Snap!.faq_snapshot_json) as Array<{ faqId: string }>;
+    expect(parsedFaqs.map((f) => f.faqId)).toEqual(
+      expect.arrayContaining(['faq_deposit_guide', 'faq_withdrawal_guide'])
+    );
+
+    // Toggling AI creates config_versions v2 with non-empty live FAQ snapshot
+    await adminService.toggleGlobalAi(env, { adminId: '9001', correlationId: 'cor_f10_snap' });
+    const v2Snap = await db
+      .prepare(`SELECT faq_snapshot_json FROM config_versions WHERE version_number = 2`)
+      .first<{ faq_snapshot_json: string }>();
+    const parsedV2Faqs = JSON.parse(v2Snap!.faq_snapshot_json) as Array<{ faqId: string }>;
+    expect(parsedV2Faqs.map((f) => f.faqId)).toEqual(
+      expect.arrayContaining(['faq_deposit_guide', 'faq_withdrawal_guide'])
+    );
+
+    // Telegram group -> supergroup migration webhook handled safely (HTTP 200, audited, SUPER_ADMIN alerted)
+    const app = createApp();
+    const migRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99901,
+          message: {
+            message_id: 901,
+            date: 1700000000,
+            chat: { id: Number(env.TELEGRAM_ADMIN_GROUP_ID), type: 'group' },
+            migrate_to_chat_id: -1001122334455,
+          },
+        }),
+      }),
+      env
+    );
+    expect(migRes.status).toBe(200);
+
+    const migAudit = await db
+      .prepare(`SELECT action, after_state_json FROM audit_logs WHERE action = 'TELEGRAM_GROUP_MIGRATED_TO_SUPERGROUP'`)
+      .first<{ action: string; after_state_json: string }>();
+    expect(migAudit).not.toBeNull();
+    expect(migAudit!.after_state_json).toContain('-1001122334455');
+
+    const migAlert = await db
+      .prepare(`SELECT target_chat_id, payload_json FROM outbox WHERE event_type = 'ADMIN_GROUP_MIGRATION_ALERT'`)
+      .first<{ target_chat_id: string; payload_json: string }>();
+    expect(migAlert!.target_chat_id).toBe('9001');
+    expect(migAlert!.payload_json).toContain('-1001122334455');
+  });
 });
+

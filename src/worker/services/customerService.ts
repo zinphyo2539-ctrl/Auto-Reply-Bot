@@ -13,6 +13,7 @@ import { notificationService } from './notificationService';
 import { encodeCallbackData } from '../lib/callbackCodec';
 import { generateMutationToken, generatePrefixedId } from '../lib/ids';
 import { systemClock } from '../lib/clock';
+import { escapeHtml } from '../lib/textChunker';
 
 export const customerService = {
   async ensureActiveCustomer(
@@ -50,6 +51,10 @@ export const customerService = {
     correlationId: string,
     nowMs = systemClock.now()
   ): Promise<void> {
+    if (customer.account_status === 'BANNED') {
+      return;
+    }
+
     const config = await configRepository.getActiveConfig(env.DB);
     await customerRepository.clearSession(env.DB, customer.telegram_user_id);
 
@@ -68,7 +73,7 @@ export const customerService = {
       aggregateType: 'CUSTOMER',
       aggregateId: customer.telegram_user_id,
       targetChatId: customer.telegram_user_id,
-      text: welcomeText,
+      text: escapeHtml(welcomeText),
       parseMode: 'HTML',
       replyMarkup,
       correlationId,
@@ -93,7 +98,11 @@ export const customerService = {
     const nowMs = params.nowMs ?? systemClock.now();
     const { customer, text, correlationId } = params;
 
-    // 1. Check active Deposit/Withdrawal wizard session first
+    if (customer.account_status === 'BANNED') {
+      return;
+    }
+
+    // 1. Check active Deposit/Withdrawal/NEEDS_INFO wizard session first
     const session = await customerRepository.getSession(env.DB, customer.telegram_user_id);
     if (session && session.expires_at > nowMs && session.wizard_type !== 'NONE') {
       if (session.wizard_type === 'DEPOSIT') {
@@ -103,6 +112,48 @@ export const customerService = {
       if (session.wizard_type === 'WITHDRAWAL') {
         await this.routeWithdrawalWizardText(env, customer, session.wizard_state, text, correlationId, nowMs);
         return;
+      }
+      if (session.wizard_type === 'NEEDS_INFO_REPLY' && session.wizard_state === 'AWAITING_CUSTOMER_INFO_REPLY') {
+        try {
+          if (session.target_request_type === 'DEPOSIT') {
+            await depositService.submitNeedsInfoReply(env, {
+              customerId: customer.telegram_user_id,
+              replyText: text,
+              telegramMessageId: params.telegramMessageId,
+              updateId: params.updateId,
+              correlationId,
+              nowMs,
+            });
+            return;
+          }
+          if (session.target_request_type === 'WITHDRAWAL') {
+            await withdrawalService.submitNeedsInfoReply(env, {
+              customerId: customer.telegram_user_id,
+              replyText: text,
+              telegramMessageId: params.telegramMessageId,
+              updateId: params.updateId,
+              correlationId,
+              nowMs,
+            });
+            return;
+          }
+        } catch (err) {
+          const errMsg = err instanceof Error ? err.message : 'Unable to submit reply';
+          const stagedErr = outboxService.prepareChunkedTextOutbox(env.DB, {
+            baseOutboxId: generatePrefixedId('obx', nowMs),
+            baseIdempotencyKey: `ninfo_err:${customer.telegram_user_id}:${correlationId}`,
+            eventType: 'WIZARD_ERROR',
+            aggregateType: 'CUSTOMER',
+            aggregateId: customer.telegram_user_id,
+            targetChatId: customer.telegram_user_id,
+            text: `⚠️ ${errMsg}`,
+            correlationId,
+            nowMs,
+          });
+          await executeAtomicBatch(env.DB, stagedErr.statements);
+          await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, stagedErr.queuePayloads);
+          return;
+        }
       }
     }
 
@@ -147,7 +198,7 @@ export const customerService = {
         aggregateType: 'TICKET',
         aggregateId: ticket.ticket_id,
         targetChatId: targetChat,
-        text: `💬 <b>Customer (${customer.first_name} | <code>${customer.telegram_user_id}</code>)</b> [Ticket <code>${ticket.ticket_id}</code>]:\n${text}`,
+        text: `💬 <b>Customer (${escapeHtml(customer.first_name)} | <code>${escapeHtml(customer.telegram_user_id)}</code>)</b> [Ticket <code>${escapeHtml(ticket.ticket_id)}</code>]:\n${escapeHtml(text)}`,
         parseMode: 'HTML',
         relatedTicketId: ticket.ticket_id,
         correlationId,
@@ -215,10 +266,15 @@ export const customerService = {
         relatedMessageId: aiMsgId,
         correlationId,
         nowMs,
+        // F-05: Atomically gate EVERY AI outbox row on customer still being in AI mode & ACTIVE
+        customerModeGate: {
+          customerId: customer.telegram_user_id,
+          requiredMode: 'AI',
+        },
       });
 
-      // Gate AI outbound message on customer still being in AI mode
-      await executeAtomicBatch(env.DB, [
+      // Atomically gate BOTH messages row and all outbox rows on customer remaining in AI mode
+      const batchResults = await executeAtomicBatch(env.DB, [
         messageRepository.prepareInsertMessage(env.DB, {
           messageId: aiMsgId,
           customerId: customer.telegram_user_id,
@@ -235,7 +291,15 @@ export const customerService = {
         ...stagedAiReply.statements,
       ]);
 
-      await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, stagedAiReply.queuePayloads);
+      // Only dispatch queue signals for outbox rows actually inserted by the mode-gated batch
+      const createdPayloads = outboxService.filterCreatedQueuePayloads(
+        batchResults,
+        1,
+        stagedAiReply.queuePayloads
+      );
+      if (createdPayloads.length > 0) {
+        await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, createdPayloads);
+      }
     } catch {
       // Fail-safe: Any Gemini error, guardrail violation (e.g. forbidden financial claim), or AI disabled escalates cleanly to HUMAN
       await handoverService.escalateCustomerToHuman(env, {

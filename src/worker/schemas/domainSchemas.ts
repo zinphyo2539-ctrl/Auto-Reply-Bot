@@ -16,7 +16,7 @@ export const MenuButtonSchema = z.object({
 });
 
 export const AntiSecretPinOtpPattern =
-  /\b(password|passwd|pin\s*[:=-]?\s*\d{4,6}|otp\s*[:=-]?\s*\d{4,8}|လျှို့ဝှက်နံပါတ်|ပင်နံပါတ်)\b/i;
+  /(?:\b(?:password|passwd)\b|\b(?:pin|otp)\b\s*(?:code\s*)?(?:is\s*|[:=-]\s*)?\d{4,8}|လျှို့ဝှက်နံပါတ်|ပင်နံပါတ်)/i;
 
 export function containsForbiddenCustomerSecret(input: string): boolean {
   return AntiSecretPinOtpPattern.test(input);

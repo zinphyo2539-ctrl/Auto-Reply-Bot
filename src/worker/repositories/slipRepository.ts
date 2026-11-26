@@ -16,6 +16,17 @@ export const slipRepository = {
       .first<SlipFingerprintRow>();
   },
 
+  async getLatestByTicket(db: D1Database, ticketId: string): Promise<SlipReviewRow | null> {
+    return db
+      .prepare(
+        `SELECT * FROM slip_reviews
+         WHERE ticket_id = ?1
+         ORDER BY created_at DESC LIMIT 1`
+      )
+      .bind(ticketId)
+      .first<SlipReviewRow>();
+  },
+
   prepareAtomicFingerprintUpsert(
     db: D1Database,
     params: {

@@ -1,4 +1,4 @@
-import type { Env, OutboxQueuePayload } from '../types/bindings';
+import type { D1PreparedStatement, Env, OutboxQueuePayload } from '../types/bindings';
 import type { SupportTicketRow, TicketType } from '../types/domain';
 import { executeAtomicBatch } from '../repositories/d1BatchCoordinator';
 import { ticketRepository } from '../repositories/ticketRepository';
@@ -7,6 +7,8 @@ import { adminRepository } from '../repositories/adminRepository';
 import { messageRepository } from '../repositories/messageRepository';
 import { auditRepository } from '../repositories/auditRepository';
 import { slipRepository } from '../repositories/slipRepository';
+import { depositRepository } from '../repositories/depositRepository';
+import { withdrawalRepository } from '../repositories/withdrawalRepository';
 import { outboxService } from './outboxService';
 import { notificationService } from './notificationService';
 import { generateMutationToken, generatePrefixedId } from '../lib/ids';
@@ -31,6 +33,11 @@ export const handoverService = {
     const nowMs = params.nowMs ?? systemClock.now();
     const mutationToken = generateMutationToken(nowMs);
 
+    const existingCustomer = await customerRepository.getById(env.DB, params.customerId);
+    if (existingCustomer && existingCustomer.account_status === 'BANNED') {
+      throw new AuthorizationError('Customer account is suspended');
+    }
+
     const existing = await ticketRepository.findActiveByCustomer(env.DB, params.customerId);
     if (existing) {
       // Ensure customer is in HUMAN mode
@@ -50,6 +57,31 @@ export const handoverService = {
     }
 
     const ticketId = generatePrefixedId('tkt', nowMs);
+    const groupCard = notificationService.buildAdminGroupTicketCard({
+      ticket: {
+        ticket_id: ticketId,
+        customer_id: params.customerId,
+        ticket_type: params.ticketType,
+        status: 'OPEN',
+        assigned_admin_id: null,
+        resolved_by_admin_id: null,
+        group_notification_msg_id: null,
+        assigned_at: null,
+        last_admin_activity_at: null,
+        reminder_sent: 0,
+        escalated: 0,
+        slip_count: 0,
+        latest_slip_id: null,
+        version: 1,
+        last_mutation_token: mutationToken,
+        resolved_at: null,
+        created_at: nowMs,
+        updated_at: nowMs,
+      },
+      customerFirstName: params.customerFirstName,
+      summaryText: params.summaryText,
+    });
+
     const stagedGroup = outboxService.prepareChunkedTextOutbox(env.DB, {
       baseOutboxId: generatePrefixedId('obx', nowMs),
       baseIdempotencyKey: `tkt_open_grp:${ticketId}`,
@@ -57,55 +89,9 @@ export const handoverService = {
       aggregateType: 'TICKET',
       aggregateId: ticketId,
       targetChatId: env.TELEGRAM_ADMIN_GROUP_ID,
-      text: notificationService.buildAdminGroupTicketCard({
-        ticket: {
-          ticket_id: ticketId,
-          customer_id: params.customerId,
-          ticket_type: params.ticketType,
-          status: 'OPEN',
-          assigned_admin_id: null,
-          resolved_by_admin_id: null,
-          group_notification_msg_id: null,
-          assigned_at: null,
-          last_admin_activity_at: null,
-          reminder_sent: 0,
-          escalated: 0,
-          slip_count: 0,
-          latest_slip_id: null,
-          version: 1,
-          last_mutation_token: mutationToken,
-          resolved_at: null,
-          created_at: nowMs,
-          updated_at: nowMs,
-        },
-        customerFirstName: params.customerFirstName,
-        summaryText: params.summaryText,
-      }).text,
+      text: groupCard.text,
       parseMode: 'HTML',
-      replyMarkup: notificationService.buildAdminGroupTicketCard({
-        ticket: {
-          ticket_id: ticketId,
-          customer_id: params.customerId,
-          ticket_type: params.ticketType,
-          status: 'OPEN',
-          assigned_admin_id: null,
-          resolved_by_admin_id: null,
-          group_notification_msg_id: null,
-          assigned_at: null,
-          last_admin_activity_at: null,
-          reminder_sent: 0,
-          escalated: 0,
-          slip_count: 0,
-          latest_slip_id: null,
-          version: 1,
-          last_mutation_token: mutationToken,
-          resolved_at: null,
-          created_at: nowMs,
-          updated_at: nowMs,
-        },
-        customerFirstName: params.customerFirstName,
-        summaryText: params.summaryText,
-      }).replyMarkup,
+      replyMarkup: groupCard.replyMarkup,
       relatedTicketId: ticketId,
       correlationId: params.correlationId,
       nowMs,
@@ -117,8 +103,29 @@ export const handoverService = {
       },
     });
 
-    const auditStmt = await auditRepository.buildInsertStatement(
+    await auditRepository.executeBatchWithAudit(
       env.DB,
+      (auditStmt) => [
+        customerRepository.prepareUpsertActiveCustomer(env.DB, {
+          customerId: params.customerId,
+          username: params.customerUsername,
+          firstName: params.customerFirstName,
+          forceHumanMode: true,
+          incrementUnread: true,
+          messagePreview: params.summaryText,
+          mutationToken,
+          nowMs,
+        }),
+        ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
+          ticketId,
+          customerId: params.customerId,
+          ticketType: params.ticketType,
+          mutationToken,
+          nowMs,
+        }),
+        auditStmt,
+        ...stagedGroup.statements,
+      ],
       {
         actorId: params.customerId,
         actorRole: 'CUSTOMER',
@@ -140,28 +147,6 @@ export const handoverService = {
       }
     );
 
-    await executeAtomicBatch(env.DB, [
-      customerRepository.prepareUpsertActiveCustomer(env.DB, {
-        customerId: params.customerId,
-        username: params.customerUsername,
-        firstName: params.customerFirstName,
-        forceHumanMode: true,
-        incrementUnread: true,
-        messagePreview: params.summaryText,
-        mutationToken,
-        nowMs,
-      }),
-      ticketRepository.prepareCreateIfNoActiveTicket(env.DB, {
-        ticketId,
-        customerId: params.customerId,
-        ticketType: params.ticketType,
-        mutationToken,
-        nowMs,
-      }),
-      auditStmt,
-      ...stagedGroup.statements,
-    ]);
-
     const active = await ticketRepository.findActiveByCustomer(env.DB, params.customerId);
     if (!active) {
       throw new ConflictError('Failed to create or retrieve active support ticket');
@@ -172,6 +157,60 @@ export const handoverService = {
       return { ticket: active, createdNew: true };
     }
     return { ticket: active, createdNew: false };
+  },
+
+  async sendAdminPrivateConsoleCard(
+    env: Env,
+    params: {
+      adminId: string;
+      ticketId: string;
+      correlationId: string;
+      nowMs?: number;
+    }
+  ): Promise<void> {
+    const nowMs = params.nowMs ?? systemClock.now();
+    const [admin, ticket] = await Promise.all([
+      adminRepository.getActiveAdmin(env.DB, params.adminId),
+      ticketRepository.getById(env.DB, params.ticketId),
+    ]);
+    if (!admin || admin.has_started_bot !== 1 || !ticket) {
+      return;
+    }
+
+    const [customer, slip, deposit, withdrawal] = await Promise.all([
+      customerRepository.getById(env.DB, ticket.customer_id),
+      slipRepository.getLatestByTicket(env.DB, ticket.ticket_id),
+      depositRepository.getLatestByTicket(env.DB, ticket.ticket_id),
+      withdrawalRepository.getLatestByTicket(env.DB, ticket.ticket_id),
+    ]);
+
+    const consoleCard = notificationService.buildAdminPrivateConsoleCard({
+      ticket,
+      customerFirstName: customer?.first_name ?? 'Customer',
+      canReviewSlips: adminRepository.hasPermission(admin, 'slip.review'),
+      isSuperAdmin: admin.role === 'SUPER_ADMIN',
+      slip,
+      deposit,
+      withdrawal,
+    });
+
+    const stagedConsole = outboxService.prepareChunkedTextOutbox(env.DB, {
+      baseOutboxId: generatePrefixedId('obx', nowMs),
+      baseIdempotencyKey: `adm_console:${ticket.ticket_id}:${admin.telegram_user_id}:${params.correlationId}`,
+      eventType: 'ADMIN_PRIVATE_CONSOLE',
+      aggregateType: 'TICKET',
+      aggregateId: ticket.ticket_id,
+      targetChatId: admin.telegram_user_id,
+      text: consoleCard.text,
+      parseMode: 'HTML',
+      replyMarkup: consoleCard.replyMarkup,
+      relatedTicketId: ticket.ticket_id,
+      correlationId: params.correlationId,
+      nowMs,
+    });
+
+    await executeAtomicBatch(env.DB, stagedConsole.statements);
+    await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, stagedConsole.queuePayloads);
   },
 
   async takeOverTicket(
@@ -204,7 +243,11 @@ export const handoverService = {
     }
 
     if (admin.has_started_bot !== 1) {
-      throw new AuthorizationError('Admin must start a private chat (/start) with the bot before claiming tickets');
+      const botHandle = env.TELEGRAM_BOT_USERNAME?.trim().replace(/^@/, '');
+      const botHint = botHandle ? `@${botHandle}` : 'the bot';
+      throw new AuthorizationError(
+        `Admin must start a private chat (/start) with ${botHint} before claiming tickets`
+      );
     }
 
     const existing = await ticketRepository.getById(env.DB, params.ticketId);
@@ -213,8 +256,31 @@ export const handoverService = {
     }
 
     const mutationToken = generateMutationToken(nowMs);
-    const auditStmt = await auditRepository.buildInsertStatement(
+
+    const results = await auditRepository.executeBatchWithAudit(
       env.DB,
+      (auditStmt) => [
+        ticketRepository.prepareAtomicClaim(env.DB, {
+          ticketId: params.ticketId,
+          adminId: params.adminId,
+          expectedVersion: params.expectedVersion,
+          mutationToken,
+          nowMs,
+        }),
+        slipRepository.prepareTransitionToUnderReviewOnClaim(env.DB, params.ticketId, mutationToken, nowMs),
+        adminRepository.prepareUpsertSession(env.DB, {
+          adminId: params.adminId,
+          sessionState: 'REPLYING_TO_CUSTOMER',
+          targetCustomerId: existing.customer_id,
+          targetTicketId: params.ticketId,
+          nowMs,
+          gateTable: 'support_tickets',
+          gatePkColumn: 'ticket_id',
+          gatePkValue: params.ticketId,
+          gateMutationToken: mutationToken,
+        }),
+        auditStmt,
+      ],
       {
         actorId: params.adminId,
         actorRole: admin.role,
@@ -236,29 +302,6 @@ export const handoverService = {
       }
     );
 
-    const results = await executeAtomicBatch(env.DB, [
-      ticketRepository.prepareAtomicClaim(env.DB, {
-        ticketId: params.ticketId,
-        adminId: params.adminId,
-        expectedVersion: params.expectedVersion,
-        mutationToken,
-        nowMs,
-      }),
-      slipRepository.prepareTransitionToUnderReviewOnClaim(env.DB, params.ticketId, mutationToken, nowMs),
-      adminRepository.prepareUpsertSession(env.DB, {
-        adminId: params.adminId,
-        sessionState: 'REPLYING_TO_CUSTOMER',
-        targetCustomerId: existing.customer_id,
-        targetTicketId: params.ticketId,
-        nowMs,
-        gateTable: 'support_tickets',
-        gatePkColumn: 'ticket_id',
-        gatePkValue: params.ticketId,
-        gateMutationToken: mutationToken,
-      }),
-      auditStmt,
-    ]);
-
     const updatedTicket = (results[0]?.results?.[0] as unknown as SupportTicketRow | undefined) ?? null;
     if (!updatedTicket) {
       await auditRepository.appendImmediate(env.DB, {
@@ -275,6 +318,14 @@ export const handoverService = {
       });
       throw new ConflictError(`Ticket ${params.ticketId} was already claimed or modified concurrently`);
     }
+
+    // F-03: Deliver private Admin Console Card directly to claiming admin's private chat
+    await this.sendAdminPrivateConsoleCard(env, {
+      adminId: params.adminId,
+      ticketId: updatedTicket.ticket_id,
+      correlationId: params.correlationId,
+      nowMs,
+    });
 
     return updatedTicket;
   },
@@ -301,8 +352,20 @@ export const handoverService = {
     }
 
     const mutationToken = generateMutationToken(nowMs);
-    const auditStmt = await auditRepository.buildInsertStatement(
+
+    // Note: Deliberately does NOT change customer.chat_mode (stays HUMAN until explicit Resolve & Return to AI)
+    const results = await auditRepository.executeBatchWithAudit(
       env.DB,
+      (auditStmt) => [
+        ticketRepository.prepareAtomicRelease(env.DB, {
+          ticketId: params.ticketId,
+          actorAdminId: params.adminId,
+          mutationToken,
+          nowMs,
+        }),
+        adminRepository.prepareClearSession(env.DB, params.adminId),
+        auditStmt,
+      ],
       {
         actorId: params.adminId,
         actorRole: admin.role,
@@ -323,18 +386,6 @@ export const handoverService = {
         mutationToken,
       }
     );
-
-    // Note: Deliberately does NOT change customer.chat_mode (stays HUMAN until explicit Resolve & Return to AI)
-    const results = await executeAtomicBatch(env.DB, [
-      ticketRepository.prepareAtomicRelease(env.DB, {
-        ticketId: params.ticketId,
-        actorAdminId: params.adminId,
-        mutationToken,
-        nowMs,
-      }),
-      adminRepository.prepareClearSession(env.DB, params.adminId),
-      auditStmt,
-    ]);
 
     const updated = (results[0]?.results?.[0] as unknown as SupportTicketRow | undefined) ?? null;
     if (!updated) {
@@ -366,19 +417,11 @@ export const handoverService = {
     }
 
     const mutationToken = generateMutationToken(nowMs);
-    const statements = [
-      ticketRepository.prepareAtomicResolve(env.DB, {
-        ticketId: params.ticketId,
-        actorAdminId: params.adminId,
-        mutationToken,
-        nowMs,
-      }),
-      adminRepository.prepareClearSession(env.DB, params.adminId),
-    ];
-
     const queuePayloads: OutboxQueuePayload[] = [];
+    const stagedReturnStatements: D1PreparedStatement[] = [];
+
     if (params.returnToAi) {
-      statements.push(
+      stagedReturnStatements.push(
         customerRepository.prepareExplicitReturnToAi(env.DB, {
           customerId: existing.customer_id,
           mutationToken,
@@ -406,12 +449,23 @@ export const handoverService = {
           mutationToken,
         },
       });
-      statements.push(...stagedNotice.statements);
+      stagedReturnStatements.push(...stagedNotice.statements);
       queuePayloads.push(...stagedNotice.queuePayloads);
     }
 
-    const auditStmt = await auditRepository.buildInsertStatement(
+    const results = await auditRepository.executeBatchWithAudit(
       env.DB,
+      (auditStmt) => [
+        ticketRepository.prepareAtomicResolve(env.DB, {
+          ticketId: params.ticketId,
+          actorAdminId: params.adminId,
+          mutationToken,
+          nowMs,
+        }),
+        adminRepository.prepareClearSession(env.DB, params.adminId),
+        ...stagedReturnStatements,
+        auditStmt,
+      ],
       {
         actorId: params.adminId,
         actorRole: admin.role,
@@ -432,9 +486,7 @@ export const handoverService = {
         mutationToken,
       }
     );
-    statements.push(auditStmt);
 
-    const results = await executeAtomicBatch(env.DB, statements);
     const updated = (results[0]?.results?.[0] as unknown as SupportTicketRow | undefined) ?? null;
     if (!updated) {
       throw new ConflictError(`Ticket ${params.ticketId} could not be resolved`);
@@ -495,44 +547,48 @@ export const handoverService = {
       nowMs,
     });
 
-    const auditStmt = await auditRepository.buildInsertStatement(env.DB, {
-      actorId: params.adminId,
-      actorRole: admin.role,
-      action: 'ADMIN_REPLIED_TO_CUSTOMER',
-      resourceType: 'TICKET',
-      resourceId: ticket.ticket_id,
-      result: 'SUCCESS',
-      afterState: { messageId, customerId: ticket.customer_id },
-      correlationId: params.correlationId,
-      sourceUpdateId: params.sourceUpdateId ?? null,
-      nowMs,
-    });
+    await auditRepository.executeBatchWithAudit(
+      env.DB,
+      (auditStmt) => {
+        const stmts = [
+          messageRepository.prepareInsertMessage(env.DB, {
+            messageId,
+            customerId: ticket.customer_id,
+            ticketId: ticket.ticket_id,
+            direction: 'OUTBOUND',
+            senderRole: 'ADMIN',
+            senderId: params.adminId,
+            messageType: 'TEXT',
+            textContent: trimmed,
+            isPotentialSlip: false,
+            deliveryStatus: 'PENDING',
+            createdAt: nowMs,
+          }),
+          ...stagedOutbox.statements,
+          auditStmt,
+        ];
 
-    const stmts = [
-      messageRepository.prepareInsertMessage(env.DB, {
-        messageId,
-        customerId: ticket.customer_id,
-        ticketId: ticket.ticket_id,
-        direction: 'OUTBOUND',
-        senderRole: 'ADMIN',
-        senderId: params.adminId,
-        messageType: 'TEXT',
-        textContent: trimmed,
-        isPotentialSlip: false,
-        deliveryStatus: 'PENDING',
-        createdAt: nowMs,
-      }),
-      ...stagedOutbox.statements,
-      auditStmt,
-    ];
+        if (ticket.assigned_admin_id === params.adminId && ticket.status === 'ASSIGNED') {
+          stmts.unshift(
+            ticketRepository.prepareTouchAdminActivity(env.DB, ticket.ticket_id, params.adminId, mutationToken, nowMs)
+          );
+        }
+        return stmts;
+      },
+      {
+        actorId: params.adminId,
+        actorRole: admin.role,
+        action: 'ADMIN_REPLIED_TO_CUSTOMER',
+        resourceType: 'TICKET',
+        resourceId: ticket.ticket_id,
+        result: 'SUCCESS',
+        afterState: { messageId, customerId: ticket.customer_id },
+        correlationId: params.correlationId,
+        sourceUpdateId: params.sourceUpdateId ?? null,
+        nowMs,
+      }
+    );
 
-    if (ticket.assigned_admin_id === params.adminId && ticket.status === 'ASSIGNED') {
-      stmts.unshift(
-        ticketRepository.prepareTouchAdminActivity(env.DB, ticket.ticket_id, params.adminId, mutationToken, nowMs)
-      );
-    }
-
-    await executeAtomicBatch(env.DB, stmts);
     await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, stagedOutbox.queuePayloads);
     return { messageId };
   },

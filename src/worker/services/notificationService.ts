@@ -211,7 +211,7 @@ export const notificationService = {
       if (params.isSuperAdmin && ['SUBMITTED', 'UNDER_REVIEW', 'NEEDS_INFO'].includes(params.deposit.status)) {
         keyboard.push([
           {
-            text: '✅ Confirm Manual Deposit Credited',
+            text: '✅ Record Manual Deposit Completed',
             callback_data: encodeCallbackData({
               namespace: 'dep',
               action: 'app',
@@ -249,19 +249,34 @@ export const notificationService = {
         `• Status: <b>${escapeHtml(params.withdrawal.status)}</b>`
       );
       if (params.isSuperAdmin) {
-        const wdRow: Array<Record<string, unknown>> = [
-          {
-            text: '🔐 View Encrypted Destination',
-            callback_data: encodeCallbackData({
-              namespace: 'wd',
-              action: 'pii',
-              targetId: params.withdrawal.withdrawal_id,
-              version: params.withdrawal.version,
-            }),
-          },
-        ];
-        if (['SUBMITTED', 'UNDER_REVIEW', 'NEEDS_INFO'].includes(params.withdrawal.status)) {
-          wdRow.push(
+        if (params.withdrawal.destination_ciphertext !== 'REDACTED') {
+          keyboard.push([
+            {
+              text: '🔐 View Encrypted Destination',
+              callback_data: encodeCallbackData({
+                namespace: 'wd',
+                action: 'pii',
+                targetId: params.withdrawal.withdrawal_id,
+                version: params.withdrawal.version,
+              }),
+            },
+          ]);
+        }
+
+        if (params.withdrawal.status === 'SUBMITTED' || params.withdrawal.status === 'NEEDS_INFO') {
+          keyboard.push([
+            {
+              text: '🔍 Start Review',
+              callback_data: encodeCallbackData({
+                namespace: 'wd',
+                action: 'rev',
+                targetId: params.withdrawal.withdrawal_id,
+                version: params.withdrawal.version,
+              }),
+            },
+          ]);
+        } else if (params.withdrawal.status === 'UNDER_REVIEW') {
+          keyboard.push([
             {
               text: '✅ Approve for Payout',
               callback_data: encodeCallbackData({
@@ -279,16 +294,33 @@ export const notificationService = {
                 targetId: params.withdrawal.withdrawal_id,
                 version: params.withdrawal.version,
               }),
-            }
-          );
-        }
-        if (['SUBMITTED', 'UNDER_REVIEW', 'APPROVED_FOR_PAYOUT'].includes(params.withdrawal.status)) {
+            },
+            {
+              text: '❓ Withdrawal Needs Info',
+              callback_data: encodeCallbackData({
+                namespace: 'wd',
+                action: 'info',
+                targetId: params.withdrawal.withdrawal_id,
+                version: params.withdrawal.version,
+              }),
+            },
+          ]);
+        } else if (params.withdrawal.status === 'APPROVED_FOR_PAYOUT') {
           keyboard.push([
             {
-              text: '💳 Record External Payout Evidence (Mark Paid)',
+              text: '💳 Record External Payout Paid',
               callback_data: encodeCallbackData({
                 namespace: 'wd',
                 action: 'paid',
+                targetId: params.withdrawal.withdrawal_id,
+                version: params.withdrawal.version,
+              }),
+            },
+            {
+              text: '❌ Reject',
+              callback_data: encodeCallbackData({
+                namespace: 'wd',
+                action: 'rej',
                 targetId: params.withdrawal.withdrawal_id,
                 version: params.withdrawal.version,
               }),
@@ -304,7 +336,6 @@ export const notificationService = {
             },
           ]);
         }
-        keyboard.push(wdRow);
       }
     }
 

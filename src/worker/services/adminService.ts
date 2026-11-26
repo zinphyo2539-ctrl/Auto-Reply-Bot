@@ -6,7 +6,8 @@ import { ticketRepository } from '../repositories/ticketRepository';
 import { configRepository } from '../repositories/configRepository';
 import { auditRepository } from '../repositories/auditRepository';
 import { generateMutationToken } from '../lib/ids';
-import { systemClock } from '../lib/clock';
+import { formatMyanmarTime, systemClock } from '../lib/clock';
+import { escapeHtml } from '../lib/textChunker';
 import { AuthorizationError, ConflictError } from '../lib/errors';
 
 export const adminService = {
@@ -61,8 +62,19 @@ export const adminService = {
     const nextEnabled = config.ai_enabled !== 1;
     const mutationToken = generateMutationToken(nowMs);
 
-    const auditStmt = await auditRepository.buildInsertStatement(
+    const results = await auditRepository.executeBatchWithAudit(
       env.DB,
+      (auditStmt) => [
+        configRepository.prepareToggleAi(env.DB, {
+          aiEnabled: nextEnabled,
+          actorAdminId: params.adminId,
+          expectedVersion: config.active_version,
+          mutationToken,
+          nowMs,
+        }),
+        configRepository.prepareSnapshotConfigVersion(env.DB, mutationToken, null),
+        auditStmt,
+      ],
       {
         actorId: params.adminId,
         actorRole: 'SUPER_ADMIN',
@@ -84,18 +96,6 @@ export const adminService = {
       }
     );
 
-    const results = await executeAtomicBatch(env.DB, [
-      configRepository.prepareToggleAi(env.DB, {
-        aiEnabled: nextEnabled,
-        actorAdminId: params.adminId,
-        expectedVersion: config.active_version,
-        mutationToken,
-        nowMs,
-      }),
-      configRepository.prepareSnapshotConfigVersion(env.DB, mutationToken, null),
-      auditStmt,
-    ]);
-
     if ((results[0]?.results?.length ?? 0) === 0) {
       throw new ConflictError('Config was modified concurrently');
     }
@@ -109,21 +109,28 @@ export const adminService = {
       ticketRepository.listOpenTickets(env.DB, 10),
     ]);
 
+    const botHandle = env.TELEGRAM_BOT_USERNAME?.trim().replace(/^@/, '') || 'unconfigured';
+    const localTime = formatMyanmarTime(systemClock.now(), env.APP_TIMEZONE);
+
     const lines = [
-      `🛡 <b>7777club Admin Console</b>`,
-      `• Admin ID: <code>${admin.telegram_user_id}</code> (<b>${admin.role}</b>)`,
+      `🛡 <b>7777club Admin Console</b> (@${escapeHtml(botHandle)})`,
+      `• Admin ID: <code>${escapeHtml(admin.telegram_user_id)}</code> (<b>${escapeHtml(admin.role)}</b>)`,
       `• AI Auto-Reply: <b>${config.ai_enabled === 1 ? 'ENABLED 🟢' : 'DISABLED 🔴'}</b> (v${config.active_version})`,
       `• Open Queue Tickets: <b>${openTickets.length}</b>`,
+      `• Server Time: <code>${escapeHtml(localTime)}</code>`,
       '',
       '<b>Telegram Admin Commands:</b>',
       '• <code>/admin</code> — View dashboard & open queue',
       '• <code>/reply &lt;TICKET_ID&gt; &lt;text&gt;</code> — Reply to customer',
       '• <code>/approve_dep &lt;DEP_ID&gt; &lt;ver&gt; &lt;EVIDENCE_REF&gt;</code> — (SUPER_ADMIN)',
       '• <code>/reject_dep &lt;DEP_ID&gt; &lt;ver&gt; &lt;REASON&gt;</code> — (SUPER_ADMIN)',
-      '• <code>/paid_wd &lt;WDR_ID&gt; &lt;ver&gt; &lt;PAYMENT_EVIDENCE&gt;</code> — (SUPER_ADMIN)',
+      '• <code>/review_wd &lt;WDR_ID&gt; &lt;ver&gt;</code> — Start review (SUPER_ADMIN)',
+      '• <code>/approve_wd &lt;WDR_ID&gt; &lt;ver&gt;</code> — Approve for payout (SUPER_ADMIN)',
+      '• <code>/paid_wd &lt;WDR_ID&gt; &lt;ver&gt; &lt;PAYMENT_EVIDENCE&gt;</code> — Record external payout (SUPER_ADMIN)',
       '• <code>/reject_wd &lt;WDR_ID&gt; &lt;ver&gt; &lt;REASON&gt;</code> — (SUPER_ADMIN)',
       '• <code>/view_wd_pii &lt;WDR_ID&gt;</code> — (SUPER_ADMIN Private Chat Only)',
       '• <code>/toggle_ai</code> — (SUPER_ADMIN)',
+      '• <code>/cancel</code> — Cancel active admin input session',
     ];
 
     return lines.join('\n');

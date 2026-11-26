@@ -23,6 +23,10 @@ export interface EnqueueOutboxSpec {
     mutationToken: string;
     extraWhereSql?: string;
   };
+  customerModeGate?: {
+    customerId: string;
+    requiredMode: 'AI' | 'HUMAN';
+  };
 }
 
 export const outboxRepository = {
@@ -32,6 +36,49 @@ export const outboxRepository = {
     const sequenceNo = spec.sequenceNo ?? 1;
     const payloadJson = JSON.stringify(spec.payload);
     const nextDispatchAt = spec.availableAt + 15000;
+
+    if (spec.customerModeGate) {
+      return db
+        .prepare(
+          `INSERT INTO outbox (
+            outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id,
+            target_chat_id, ordering_key, sequence_no, telegram_method, payload_json,
+            is_idempotent_method, related_message_id, related_ticket_id,
+            status, attempt_count, max_attempts, available_at, next_dispatch_at,
+            created_at, updated_at
+          )
+          SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 'PENDING', 0, 6, ?14, ?15, ?16, ?16
+          WHERE EXISTS (
+            SELECT 1 FROM customers
+            WHERE telegram_user_id = ?17
+              AND account_status = 'ACTIVE'
+              AND chat_mode = ?18
+          )
+          ON CONFLICT(idempotency_key) DO NOTHING
+          RETURNING outbox_id`
+        )
+        .bind(
+          spec.outboxId,
+          spec.idempotencyKey,
+          spec.eventType,
+          spec.aggregateType,
+          spec.aggregateId,
+          spec.targetChatId,
+          orderingKey,
+          sequenceNo,
+          spec.telegramMethod,
+          payloadJson,
+          isIdempotent,
+          spec.relatedMessageId ?? null,
+          spec.relatedTicketId ?? null,
+          spec.availableAt,
+          nextDispatchAt,
+          spec.nowMs,
+          spec.customerModeGate.customerId,
+          spec.customerModeGate.requiredMode
+        );
+    }
 
     if (spec.gateCondition) {
       const extraClause = spec.gateCondition.extraWhereSql ? ` AND ${spec.gateCondition.extraWhereSql}` : '';
@@ -171,6 +218,11 @@ export const outboxRepository = {
     return res.meta.changes === 1;
   },
 
+  /**
+   * Lease-fenced SENDING -> SENT transition.
+   * Related messages/ticket updates are strictly gated on the outbox transition succeeding
+   * inside the same D1 batch so a stale worker can never overwrite a recovery decision.
+   */
   async markSent(
     db: D1Database,
     params: {
@@ -179,7 +231,7 @@ export const outboxRepository = {
       telegramMessageId: number | null;
       nowMs: number;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
     const stmts: D1PreparedStatement[] = [
       db
         .prepare(
@@ -191,7 +243,10 @@ export const outboxRepository = {
                lease_token = NULL,
                lease_expires_at = NULL,
                updated_at = ?4
-           WHERE outbox_id = ?1 AND lease_token = ?2`
+           WHERE outbox_id = ?1
+             AND status = 'SENDING'
+             AND lease_token = ?2
+           RETURNING outbox_id`
         )
         .bind(params.outbox.outbox_id, params.leaseToken, params.telegramMessageId, params.nowMs),
     ];
@@ -203,9 +258,20 @@ export const outboxRepository = {
             `UPDATE messages
              SET delivery_status = 'SENT',
                  telegram_message_id = COALESCE(?2, telegram_message_id)
-             WHERE message_id = ?1`
+             WHERE message_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE outbox_id = ?3
+                   AND status = 'SENT'
+                   AND sent_at = ?4
+               )`
           )
-          .bind(params.outbox.related_message_id, params.telegramMessageId)
+          .bind(
+            params.outbox.related_message_id,
+            params.telegramMessageId,
+            params.outbox.outbox_id,
+            params.nowMs
+          )
       );
     }
 
@@ -219,13 +285,25 @@ export const outboxRepository = {
           .prepare(
             `UPDATE support_tickets
              SET group_notification_msg_id = ?2
-             WHERE ticket_id = ?1`
+             WHERE ticket_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE outbox_id = ?3
+                   AND status = 'SENT'
+                   AND sent_at = ?4
+               )`
           )
-          .bind(params.outbox.related_ticket_id, params.telegramMessageId)
+          .bind(
+            params.outbox.related_ticket_id,
+            params.telegramMessageId,
+            params.outbox.outbox_id,
+            params.nowMs
+          )
       );
     }
 
-    await db.batch(stmts);
+    const results = await db.batch(stmts);
+    return (results[0]?.results?.length ?? 0) === 1;
   },
 
   async markRetryableFailure(
@@ -237,18 +315,17 @@ export const outboxRepository = {
       errorMsg: string;
       nowMs: number;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
     if (params.outbox.attempt_count >= params.outbox.max_attempts) {
-      await this.markPermanentFailure(db, {
+      return this.markPermanentFailure(db, {
         outbox: params.outbox,
         leaseToken: params.leaseToken,
         errorMsg: `MAX_ATTEMPTS_EXHAUSTED: ${params.errorMsg}`,
         nowMs: params.nowMs,
       });
-      return;
     }
 
-    await db
+    const res = await db
       .prepare(
         `UPDATE outbox
          SET status = 'RETRYABLE_FAILURE',
@@ -259,7 +336,9 @@ export const outboxRepository = {
              lease_token = NULL,
              lease_expires_at = NULL,
              updated_at = ?5
-         WHERE outbox_id = ?1 AND lease_token = ?2`
+         WHERE outbox_id = ?1
+           AND status = 'SENDING'
+           AND lease_token = ?2`
       )
       .bind(
         params.outbox.outbox_id,
@@ -269,6 +348,7 @@ export const outboxRepository = {
         params.nowMs
       )
       .run();
+    return res.meta.changes === 1;
   },
 
   async markDeliveryUncertain(
@@ -279,7 +359,8 @@ export const outboxRepository = {
       errorMsg: string;
       nowMs: number;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const truncatedErr = params.errorMsg.slice(0, 500);
     const stmts: D1PreparedStatement[] = [
       params.leaseToken
         ? db
@@ -292,14 +373,12 @@ export const outboxRepository = {
                    lease_token = NULL,
                    lease_expires_at = NULL,
                    updated_at = ?3
-               WHERE outbox_id = ?1 AND lease_token = ?2`
+               WHERE outbox_id = ?1
+                 AND status = 'SENDING'
+                 AND lease_token = ?2
+               RETURNING outbox_id`
             )
-            .bind(
-              params.outbox.outbox_id,
-              params.leaseToken,
-              params.nowMs,
-              params.errorMsg.slice(0, 500)
-            )
+            .bind(params.outbox.outbox_id, params.leaseToken, params.nowMs, truncatedErr)
         : db
             .prepare(
               `UPDATE outbox
@@ -310,20 +389,34 @@ export const outboxRepository = {
                    lease_token = NULL,
                    lease_expires_at = NULL,
                    updated_at = ?2
-               WHERE outbox_id = ?1 AND status = 'SENDING'`
+               WHERE outbox_id = ?1
+                 AND status = 'SENDING'
+                 AND lease_expires_at <= ?2
+               RETURNING outbox_id`
             )
-            .bind(params.outbox.outbox_id, params.nowMs, params.errorMsg.slice(0, 500)),
+            .bind(params.outbox.outbox_id, params.nowMs, truncatedErr),
     ];
 
     if (params.outbox.related_message_id) {
       stmts.push(
         db
-          .prepare(`UPDATE messages SET delivery_status = 'DELIVERY_UNCERTAIN' WHERE message_id = ?1`)
-          .bind(params.outbox.related_message_id)
+          .prepare(
+            `UPDATE messages
+             SET delivery_status = 'DELIVERY_UNCERTAIN'
+             WHERE message_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE outbox_id = ?2
+                   AND status = 'DELIVERY_UNCERTAIN'
+                   AND delivery_uncertain_at = ?3
+               )`
+          )
+          .bind(params.outbox.related_message_id, params.outbox.outbox_id, params.nowMs)
       );
     }
 
-    await db.batch(stmts);
+    const results = await db.batch(stmts);
+    return (results[0]?.results?.length ?? 0) === 1;
   },
 
   async markPermanentFailure(
@@ -334,7 +427,8 @@ export const outboxRepository = {
       errorMsg: string;
       nowMs: number;
     }
-  ): Promise<void> {
+  ): Promise<boolean> {
+    const truncatedErr = params.errorMsg.slice(0, 500);
     const stmts: D1PreparedStatement[] = [
       db
         .prepare(
@@ -345,20 +439,50 @@ export const outboxRepository = {
                lease_token = NULL,
                lease_expires_at = NULL,
                updated_at = ?4
-           WHERE outbox_id = ?1 AND lease_token = ?2`
+           WHERE outbox_id = ?1
+             AND status = 'SENDING'
+             AND lease_token = ?2
+           RETURNING outbox_id`
         )
-        .bind(params.outbox.outbox_id, params.leaseToken, params.errorMsg.slice(0, 500), params.nowMs),
+        .bind(params.outbox.outbox_id, params.leaseToken, truncatedErr, params.nowMs),
     ];
 
     if (params.outbox.related_message_id) {
       stmts.push(
         db
-          .prepare(`UPDATE messages SET delivery_status = 'PERMANENT_FAILURE' WHERE message_id = ?1`)
-          .bind(params.outbox.related_message_id)
+          .prepare(
+            `UPDATE messages
+             SET delivery_status = 'PERMANENT_FAILURE'
+             WHERE message_id = ?1
+               AND EXISTS (
+                 SELECT 1 FROM outbox
+                 WHERE outbox_id = ?2
+                   AND status = 'PERMANENT_FAILURE'
+                   AND updated_at = ?3
+               )`
+          )
+          .bind(params.outbox.related_message_id, params.outbox.outbox_id, params.nowMs)
       );
     }
 
-    await db.batch(stmts);
+    const results = await db.batch(stmts);
+    return (results[0]?.results?.length ?? 0) === 1;
+  },
+
+  async pruneTerminalOutboxRows(db: D1Database, cutoffMs: number, limit = 500): Promise<number> {
+    const res = await db
+      .prepare(
+        `DELETE FROM outbox
+         WHERE rowid IN (
+           SELECT rowid FROM outbox
+           WHERE status IN ('SENT', 'PERMANENT_FAILURE')
+             AND updated_at <= ?1
+           LIMIT ?2
+         )`
+      )
+      .bind(cutoffMs, limit)
+      .run();
+    return res.meta.changes ?? 0;
   },
 
   async claimDueForCronDispatch(db: D1Database, nowMs: number, limit = 20): Promise<OutboxRow[]> {
