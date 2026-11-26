@@ -1,0 +1,6 @@
+{
+  "name": "7777club VIP Gaming Telegram AI Support Engine",
+  "description": "Cloudflare-Native Telegram AI Customer Support & Manual Admin Deposit/Withdrawal Management System (Phase 2 v3.0.3 & Phase 3 Implementation)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

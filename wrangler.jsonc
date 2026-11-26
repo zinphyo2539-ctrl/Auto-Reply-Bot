@@ -1,0 +1,108 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "vip-gaming-bot",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2025-03-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  },
+  "triggers": {
+    "crons": [
+      "* * * * *",
+      "*/5 * * * *",
+      "0 20 * * *"
+    ]
+  },
+  "env": {
+    "staging": {
+      "vars": {
+        "ENVIRONMENT": "staging",
+        "TELEGRAM_BOT_USERNAME": "CONFIGURED_IN_CLOUDFLARE_ENV",
+        "TELEGRAM_ADMIN_GROUP_ID": "CONFIGURED_IN_CLOUDFLARE_ENV",
+        "SUPER_ADMIN_IDS": "CONFIGURED_IN_CLOUDFLARE_ENV",
+        "OFFICIAL_CHANNEL_URL": "https://t.me/slotmyanmar77777",
+        "GEMINI_MODEL": "gemini-2.5-flash",
+        "APP_TIMEZONE": "Asia/Yangon",
+        "SUPPORT_REMINDER_MINUTES": "30",
+        "SUPPORT_ESCALATION_MINUTES": "60",
+        "RETENTION_MESSAGES_DAYS": "180",
+        "RETENTION_FINGERPRINTS_DAYS": "365",
+        "RETENTION_AUDIT_DAYS": "365",
+        "RETENTION_WITHDRAWAL_PII_DAYS": "30",
+        "ENCRYPTION_KEY_VERSION": "1"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "vip-gaming-d1-staging",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          {
+            "binding": "OUTBOX_QUEUE",
+            "queue": "vip-outbox-queue-staging"
+          }
+        ],
+        "consumers": [
+          {
+            "queue": "vip-outbox-queue-staging",
+            "max_batch_size": 10,
+            "max_batch_timeout": 1,
+            "max_retries": 3,
+            "max_concurrency": 5,
+            "dead_letter_queue": "vip-outbox-dlq-staging"
+          }
+        ]
+      }
+    },
+    "production": {
+      "vars": {
+        "ENVIRONMENT": "production",
+        "TELEGRAM_BOT_USERNAME": "PENDING_OWNER_CONFIRMATION",
+        "TELEGRAM_ADMIN_GROUP_ID": "PENDING_OWNER_CONFIGURATION",
+        "SUPER_ADMIN_IDS": "PENDING_OWNER_CONFIGURATION",
+        "OFFICIAL_CHANNEL_URL": "https://t.me/slotmyanmar77777",
+        "GEMINI_MODEL": "gemini-2.5-flash",
+        "APP_TIMEZONE": "Asia/Yangon",
+        "SUPPORT_REMINDER_MINUTES": "30",
+        "SUPPORT_ESCALATION_MINUTES": "60",
+        "RETENTION_MESSAGES_DAYS": "180",
+        "RETENTION_FINGERPRINTS_DAYS": "365",
+        "RETENTION_AUDIT_DAYS": "365",
+        "RETENTION_WITHDRAWAL_PII_DAYS": "30",
+        "ENCRYPTION_KEY_VERSION": "1"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "vip-gaming-d1-prod",
+          "database_id": "00000000-0000-0000-0000-000000000000",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "queues": {
+        "producers": [
+          {
+            "binding": "OUTBOX_QUEUE",
+            "queue": "vip-outbox-queue-prod"
+          }
+        ],
+        "consumers": [
+          {
+            "queue": "vip-outbox-queue-prod",
+            "max_batch_size": 10,
+            "max_batch_timeout": 1,
+            "max_retries": 3,
+            "max_concurrency": 5,
+            "dead_letter_queue": "vip-outbox-dlq-prod"
+          }
+        ]
+      }
+    }
+  }
+}
