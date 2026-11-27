@@ -179,6 +179,7 @@ export const updateRouter = {
     // F-01: Match /start and /start <payload> in private chat to mark admin has_started_bot = 1
     if (admin && msg.chat.type === 'private' && (text === '/start' || text.startsWith('/start '))) {
       await adminRepository.markBotStarted(env.DB, admin.telegram_user_id, generateMutationToken(nowMs), nowMs);
+      await outboxService.recoverHeldAdminNotifications(env, nowMs, correlationId);
       const cust = await customerService.ensureActiveCustomer(env, {
         customerId: userId,
         username: msg.from.username ?? null,

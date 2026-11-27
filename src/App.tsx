@@ -40,18 +40,18 @@ const VERIFICATION_ROWS: VerificationRow[] = [
     resultEn: 'dist-worker/index.js compiled',
   },
   {
-    labelMy: 'SQLite D1 Unit & Regression Tests',
-    labelEn: 'SQLite D1 Unit & Regression Tests',
-    command: 'npm run test:unit',
-    resultMy: '30 / 30 အောင်မြင်',
-    resultEn: '30 / 30 passed',
+    labelMy: 'SQLite D1 Unit, Guard & Regression Tests',
+    labelEn: 'SQLite D1 Unit, Guard & Regression Tests',
+    command: 'npm test',
+    resultMy: '57 / 57 အောင်မြင် (5 test suites)',
+    resultEn: '57 / 57 passed (5 test suites)',
   },
   {
     labelMy: 'Real Cloudflare workerd + Miniflare D1',
     labelEn: 'Real Cloudflare workerd + Miniflare D1',
     command: 'npm run test:workerd',
-    resultMy: '4 / 4 အောင်မြင်',
-    resultEn: '4 / 4 passed',
+    resultMy: '2 / 2 အောင်မြင်',
+    resultEn: '2 / 2 passed',
   },
   {
     labelMy: 'Local Wrangler D1 Migrations (0001–0004)',
@@ -65,54 +65,54 @@ const VERIFICATION_ROWS: VerificationRow[] = [
 const STAGING_STEPS: StagingStep[] = [
   {
     number: '01',
-    titleMy: 'Cloudflare D1 နှင့် Queues ဖန်တီးပါ',
-    titleEn: 'Provision Cloudflare D1 and Queues',
+    titleMy: 'Live Worker (auto-reply-bot) အစားထိုးမှု အန္တရာယ် ဆုံးဖြတ်ရန် (Blocker)',
+    titleEn: 'Resolve Live Worker (auto-reply-bot) Replacement Blocker & Provision D1/Queues',
     detailMy:
-      'Staging အတွက် vip-gaming-d1-staging database နှင့် vip-outbox-queue-staging, vip-outbox-dlq-staging queue နှစ်ခုကို Cloudflare dashboard သို့မဟုတ် Wrangler CLI ဖြင့် ဖန်တီးပြီး wrangler.jsonc ထဲရှိ placeholder database_id နေရာတွင် ထည့်သွင်းပါ။',
+      'သတိပေးချက် — auto-reply-bot သည် လက်ရှိ live traffic 100% လက်ခံနေသော Worker (v7) ဖြစ်ပါသည်။ Root deploy လုပ်ပါက လက်ရှိ auto-reply-bot ကို staging config ဖြင့် အစားထိုးမည်ဖြစ်သဖြင့် Owner မှ (၁) auto-reply-bot အား ယာယီအစားထိုးရန် တရားဝင်ခွင့်ပြုချက် သို့မဟုတ် (၂) သီးခြား staging Worker ခွဲထုတ်ရန် ဆုံးဖြတ်ရပါမည်။ ထို့နောက် vip-gaming-d1-staging နှင့် staging queue နှစ်ခုကို ဖန်တီးပါ။',
     detailEn:
-      'Create the vip-gaming-d1-staging D1 database along with vip-outbox-queue-staging and vip-outbox-dlq-staging queues, then replace the placeholder database_id inside wrangler.jsonc.',
+      'CRITICAL BLOCKER: auto-reply-bot is an existing live Worker (v7) receiving 100% traffic. Root deployment under Architecture B replaces the live auto-reply-bot Worker with staging configuration. Owner must explicitly decide between (1) authorized temporary replacement of auto-reply-bot or (2) a dedicated separate staging Worker identity, then provision vip-gaming-d1-staging and the staging queues.',
     snippet:
       'wrangler d1 create vip-gaming-d1-staging\nwrangler queues create vip-outbox-queue-staging\nwrangler queues create vip-outbox-dlq-staging',
   },
   {
     number: '02',
-    titleMy: 'Staging Configuration တန်ဖိုးများ ဖြည့်သွင်းပါ',
-    titleEn: 'Set Non-Secret Staging Variables',
+    titleMy: 'Cloudflare Dashboard Variables (keep_vars: true) သတ်မှတ်ပါ',
+    titleEn: 'Configure Dashboard-Managed Plaintext Variables (Strategy 1)',
     detailMy:
-      'wrangler.jsonc (env.staging.vars) အတွင်း TELEGRAM_BOT_USERNAME (@ မပါဘဲ), TELEGRAM_ADMIN_GROUP_ID (Admin Supergroup ID), နှင့် SUPER_ADMIN_IDS (Super Admin Telegram User ID များ) ကို သတ်မှတ်ပါ။',
+      'TELEGRAM_BOT_USERNAME (@ မပါဘဲ), TELEGRAM_ADMIN_GROUP_ID (Admin Supergroup ID), နှင့် SUPER_ADMIN_IDS တို့ကို wrangler.jsonc ထဲတွင် မထည့်ဘဲ Cloudflare Dashboard (Variables) တွင်သာ သတ်မှတ်ပါ။ keep_vars: true က ထိုတန်ဖိုးများကို deploy လုပ်တိုင်း မပျက်အောင် ထိန်းသိမ်းပေးပါသည်။',
     detailEn:
-      'Populate TELEGRAM_BOT_USERNAME (without @), TELEGRAM_ADMIN_GROUP_ID (negative supergroup chat ID), and SUPER_ADMIN_IDS (comma-separated Telegram user IDs) inside wrangler.jsonc under env.staging.vars.',
+      'Set TELEGRAM_BOT_USERNAME (without @), TELEGRAM_ADMIN_GROUP_ID (negative supergroup chat ID), and SUPER_ADMIN_IDS inside Cloudflare Dashboard (Settings -> Variables). They are omitted from wrangler.jsonc and preserved across deploys by top-level "keep_vars": true.',
   },
   {
     number: '03',
-    titleMy: 'Cloudflare Secrets များ သွင်းပါ',
-    titleEn: 'Upload Required Cloudflare Secrets',
+    titleMy: 'ယခင် Plaintext Secrets များကို ဖျက်၍ Encrypted Secrets အဖြစ် သွင်းပါ',
+    titleEn: 'Purge Historical Plaintext Credentials & Upload Encrypted Secrets',
     detailMy:
-      'Secret များကို code ထဲတွင် မထည့်ဘဲ wrangler secret put ဖြင့်သာ သွင်းပါ။ WITHDRAWAL_PII_ENCRYPTION_KEY သည် 32-byte random key (openssl rand -base64 32) ဖြစ်ရမည်။',
+      'အရေးကြီးသတိပေးချက် — keep_vars: true သည် Dashboard ပေါ်ရှိ Plaintext variable များကို ဆက်လက်ထိန်းသိမ်းပေးပြီး Secret အဖြစ် အလိုအလျောက် မပြောင်းပေးပါ။ Dashboard တွင် GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET သို့မဟုတ် WITHDRAWAL_PII_ENCRYPTION_KEY တို့ Plaintext (Text) အဖြစ် ရှိနေပါက အရင်ဖျက်ပြီး wrangler secret put (Encrypted Secret) ဖြင့်သာ အသစ်ထည့်ပါ။',
     detailEn:
-      'Upload all secrets via wrangler secret put (never commit secrets). Generate WITHDRAWAL_PII_ENCRYPTION_KEY as strict 32-byte random key material using openssl rand -base64 32.',
+      'CRITICAL: "keep_vars: true" preserves existing Dashboard plaintext variables and does NOT convert them into encrypted Secrets. Inspect Cloudflare Dashboard and delete any historical plaintext bindings for GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_WEBHOOK_SECRET, or WITHDRAWAL_PII_ENCRYPTION_KEY, then upload rotated credentials strictly as Encrypted Secrets.',
     snippet:
-      'wrangler secret put TELEGRAM_BOT_TOKEN --env staging\nwrangler secret put TELEGRAM_WEBHOOK_SECRET --env staging\nwrangler secret put GEMINI_API_KEY --env staging\nwrangler secret put WITHDRAWAL_PII_ENCRYPTION_KEY --env staging',
+      'wrangler secret put TELEGRAM_BOT_TOKEN\nwrangler secret put TELEGRAM_WEBHOOK_SECRET\nwrangler secret put GEMINI_API_KEY\nwrangler secret put WITHDRAWAL_PII_ENCRYPTION_KEY',
   },
   {
     number: '04',
-    titleMy: 'Remote D1 Migration နှင့် Staging Deploy လုပ်ပါ',
-    titleEn: 'Apply Remote Migrations and Deploy Worker',
+    titleMy: 'Remote D1 Migration (0001–0004) နှင့် ခွင့်ပြုချက်ရမှသာ Staging Deploy တင်ပါ',
+    titleEn: 'Apply Remote Migrations (0001–0004) and Deploy Only After Owner Authorization',
     detailMy:
-      'Migration 0001 မှ 0004 အထိကို remote Staging D1 ပေါ်တွင် apply လုပ်ပြီး Staging Worker ကို deploy တင်ပါ။',
+      'Migration 0001 မှ 0004 အထိကို remote Staging D1 ပေါ်တွင် apply လုပ်ပြီး npm run lint && npm test စစ်ဆေးအောင်မြင်ကာ Owner မှ live Worker အစားထိုးမှု သို့မဟုတ် သီးခြား staging Worker သတ်မှတ်မှုကို ခွင့်ပြုမှသာ deploy တင်ပါ။',
     detailEn:
-      'Apply migrations 0001 through 0004 to the remote Staging D1 database, then deploy the Cloudflare Worker to the staging environment.',
+      'Apply migrations 0001 through 0004 to the remote Staging D1 database, verify npm run lint && npm test pass, and deploy only after explicit Owner authorization of the target Worker identity.',
     snippet:
-      'wrangler d1 migrations apply vip-gaming-d1-staging --remote --env staging\nwrangler deploy --env staging',
+      'wrangler d1 migrations apply vip-gaming-d1-staging --remote\nnpm run lint && npm test && npm run build:worker',
   },
   {
     number: '05',
     titleMy: 'Telegram Webhook ချိတ်ဆက်ပြီး Super Admin /start လုပ်ပါ',
     titleEn: 'Register Telegram Webhook and Activate Super Admin Chat',
     detailMy:
-      'Telegram setWebhook ကို secret_token နှင့်တကွ ချိတ်ဆက်ပါ။ ထို့နောက် Super Admin တစ်ဦးချင်းစီသည် Bot နှင့် private chat တွင် /start ပေးပို့၍ Private Console နှင့် PII DM ကို ဖွင့်ပါ။ FAQ/Prompt စစ်ဆေးပြီးမှသာ /toggle_ai ဖြင့် AI ကို ဖွင့်ပါ (bootstrap တွင် ai_enabled = 0 ဖြင့် လုံခြုံစွာ စတင်ထားပါသည်)။',
+      'Telegram setWebhook ကို secret_token နှင့်တကွ ချိတ်ဆက်ပါ။ ထို့နောက် Super Admin တစ်ဦးချင်းစီသည် Bot နှင့် private chat တွင် /start ပေးပို့၍ Private Console နှင့် PII DM ကို ဖွင့်ပါ။ Super Admin /start မလုပ်ရသေးချိန်တွင် Admin Group ပို့မရပါက Outbox မှ RETRYABLE_FAILURE အဖြစ် သိမ်းဆည်းထားပြီး /start လုပ်သည်နှင့် အလိုအလျောက် ပြန်ပို့ပေးပါသည်။',
     detailEn:
-      'Register your Telegram webhook pointing to https://<staging-worker-url>/webhook with secret_token matching TELEGRAM_WEBHOOK_SECRET. Each SUPER_ADMIN must send /start in private chat with the bot to activate private console & PII DM delivery. Enable AI explicitly with /toggle_ai once FAQs are confirmed (bootstraps safely with ai_enabled = 0).',
+      'Register your Telegram webhook pointing to https://<staging-worker-url>/webhook with secret_token matching TELEGRAM_WEBHOOK_SECRET. Each SUPER_ADMIN must send /start in private chat with the bot to activate private console & PII DM delivery. Any admin alerts queued before /start or group ID setup are held safely in RETRYABLE_FAILURE and automatically released upon /start.',
   },
 ];
 
@@ -221,7 +221,7 @@ export default function App() {
               </div>
               <div className="py-3 flex justify-between gap-4">
                 <dt className="text-zinc-500">{lang === 'my' ? 'Database' : 'Database'}</dt>
-                <dd className="font-mono text-xs text-zinc-900 text-right tabular-nums">D1 SQLite · 18 tables · 4 migrations</dd>
+                <dd className="font-mono text-xs text-zinc-900 text-right tabular-nums">D1 SQLite · 18 tables · 5 migrations</dd>
               </div>
               <div className="py-3 flex justify-between gap-4">
                 <dt className="text-zinc-500">{lang === 'my' ? 'Async Delivery' : 'Async Delivery'}</dt>

@@ -3,7 +3,7 @@ import { outboxRepository } from '../repositories/outboxRepository';
 import { adminRepository } from '../repositories/adminRepository';
 import { auditRepository } from '../repositories/auditRepository';
 import { executeAtomicBatch } from '../repositories/d1BatchCoordinator';
-import { telegramService } from '../services/telegramService';
+import { isValidTelegramChatId, telegramService } from '../services/telegramService';
 import { outboxService } from '../services/outboxService';
 import { generateLeaseToken, generatePrefixedId } from '../lib/ids';
 import { systemClock } from '../lib/clock';
@@ -239,7 +239,7 @@ export const outboxConsumer = {
     const getNow = clock ?? (nowMs !== undefined ? () => nowMs : () => systemClock.now());
     const startNow = getNow();
 
-    const existing = await outboxRepository.getById(env.DB, outboxId);
+    let existing = await outboxRepository.getById(env.DB, outboxId);
     if (!existing) return { outcome: 'SKIPPED' };
 
     // Strict safety invariant: NEVER auto-replay SENT, PERMANENT_FAILURE, or DELIVERY_UNCERTAIN
@@ -249,6 +249,22 @@ export const outboxConsumer = {
       existing.status === 'DELIVERY_UNCERTAIN'
     ) {
       return { outcome: 'SKIPPED' };
+    }
+
+    // Dynamic healing if TELEGRAM_ADMIN_GROUP_ID was configured after an UNCONFIGURED_ADMIN_GROUP_CHAT row was created
+    if (
+      (existing.status === 'PENDING' || existing.status === 'RETRYABLE_FAILURE') &&
+      existing.target_chat_id === 'UNCONFIGURED_ADMIN_GROUP_CHAT' &&
+      isValidTelegramChatId(env.TELEGRAM_ADMIN_GROUP_ID)
+    ) {
+      const healed = await outboxRepository.healUnconfiguredTargetChatId(env.DB, {
+        outboxId,
+        newTargetChatId: env.TELEGRAM_ADMIN_GROUP_ID.trim(),
+        nowMs: startNow,
+      });
+      if (healed) {
+        existing = healed;
+      }
     }
 
     const leaseOwner = queueEventId ?? generatePrefixedId('con', startNow);
@@ -389,18 +405,22 @@ export const outboxConsumer = {
       return { outcome: 'SENT' };
     } catch (err) {
       const errNow = getNow();
+      let isExhaustedRetry = false;
 
       if (err instanceof RateLimitError) {
-        const delayMs = Math.max(err.retryAfterSeconds, 5) * 1000;
-        const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
-          outbox: claimed,
-          leaseToken,
-          nextAvailableAt: errNow + delayMs,
-          errorMsg: err.message,
-          nowMs: errNow,
-        });
-        await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
-        return { outcome: markedRetry ? 'RETRYABLE_FAILURE' : 'SKIPPED' };
+        if (claimed.attempt_count < claimed.max_attempts) {
+          const delayMs = Math.max(err.retryAfterSeconds, 5) * 1000;
+          const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
+            outbox: claimed,
+            leaseToken,
+            nextAvailableAt: errNow + delayMs,
+            errorMsg: err.message,
+            nowMs: errNow,
+          });
+          await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+          return { outcome: markedRetry ? 'RETRYABLE_FAILURE' : 'SKIPPED' };
+        }
+        isExhaustedRetry = true;
       }
 
       if (err instanceof ExternalServiceError) {
@@ -429,21 +449,180 @@ export const outboxConsumer = {
         }
 
         if (err.retryable) {
-          const backoffMs = Math.min(300000, Math.pow(2, claimed.attempt_count) * 5000);
-          const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
-            outbox: claimed,
-            leaseToken,
-            nextAvailableAt: errNow + backoffMs,
-            errorMsg: err.message,
-            nowMs: errNow,
-          });
-          await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
-          return { outcome: markedRetry ? 'RETRYABLE_FAILURE' : 'SKIPPED' };
+          if (claimed.attempt_count < claimed.max_attempts) {
+            const backoffMs = Math.min(300000, Math.pow(2, claimed.attempt_count) * 5000);
+            const markedRetry = await outboxRepository.markRetryableFailure(env.DB, {
+              outbox: claimed,
+              leaseToken,
+              nextAvailableAt: errNow + backoffMs,
+              errorMsg: err.message,
+              nowMs: errNow,
+            });
+            await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+            return { outcome: markedRetry ? 'RETRYABLE_FAILURE' : 'SKIPPED' };
+          }
+          isExhaustedRetry = true;
         }
       }
 
-      // Permanent failure (e.g. 400/403 bot blocked/kicked)
-      const errMsg = err instanceof Error ? err.message : String(err);
+      const rawErrMsg = err instanceof Error ? err.message : String(err);
+      const errMsg = isExhaustedRetry ? `MAX_ATTEMPTS_EXHAUSTED: ${rawErrMsg}` : rawErrMsg;
+
+      const configuredGroupChatId = isValidTelegramChatId(env.TELEGRAM_ADMIN_GROUP_ID)
+        ? env.TELEGRAM_ADMIN_GROUP_ID.trim()
+        : null;
+      const isTargetAdminGroup =
+        claimed.target_chat_id === 'UNCONFIGURED_ADMIN_GROUP_CHAT' ||
+        !isValidTelegramChatId(claimed.target_chat_id) ||
+        (configuredGroupChatId !== null && claimed.target_chat_id === configuredGroupChatId);
+
+      // Section 6 Operational Safety Invariant:
+      // If an admin group notification fails permanently (or exhausts retries), check for active started SUPER_ADMINs.
+      // If ZERO active started SUPER_ADMINs exist, NEVER mark the notification SENT or abandon it in PERMANENT_FAILURE:
+      // hold it in RETRYABLE_FAILURE so it recovers automatically once a SUPER_ADMIN runs /start or TELEGRAM_ADMIN_GROUP_ID is configured.
+      if (
+        isTargetAdminGroup &&
+        (claimed.event_type === 'GROUP_ALERT' ||
+          err instanceof PermanentProcessingError ||
+          isExhaustedRetry)
+      ) {
+        const superAdmins = await adminRepository.listActiveSuperAdmins(env.DB);
+
+        if (superAdmins.length === 0) {
+          const holdReason = `ADMIN_NOTIFICATION_CHANNEL_UNAVAILABLE: ${errMsg}`;
+          const held = await outboxRepository.holdForAdminRecovery(env.DB, {
+            outbox: claimed,
+            leaseToken,
+            nextAvailableAt: errNow + 60000,
+            errorMsg: holdReason,
+            nowMs: errNow,
+          });
+
+          if (!held) {
+            logger.log({
+              level: 'WARN',
+              event: 'OUTBOX_LEASE_LOST_BEFORE_ADMIN_HOLD',
+              correlationId,
+              outboxId,
+            });
+            await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+            return { outcome: 'SKIPPED' };
+          }
+
+          logger.log({
+            level: 'ERROR',
+            event: 'ADMIN_NOTIFICATION_NO_REACHABLE_ADMIN',
+            correlationId,
+            outboxId,
+            ticketId: claimed.related_ticket_id,
+            metadata: {
+              targetChatId: claimed.target_chat_id,
+              eventType: claimed.event_type,
+              aggregateType: claimed.aggregate_type,
+              aggregateId: claimed.aggregate_id,
+              heldStatus: 'RETRYABLE_FAILURE',
+            },
+          });
+
+          await auditRepository.appendImmediate(env.DB, {
+            actorId: leaseOwner,
+            actorRole: 'SYSTEM',
+            action: 'ADMIN_NOTIFICATION_HELD_NO_REACHABLE_ADMIN',
+            resourceType: 'OUTBOX',
+            resourceId: outboxId,
+            result: 'FAILURE',
+            afterState: {
+              targetChatId: claimed.target_chat_id,
+              eventType: claimed.event_type,
+              aggregateType: claimed.aggregate_type,
+              aggregateId: claimed.aggregate_id,
+              relatedTicketId: claimed.related_ticket_id,
+              heldStatus: 'RETRYABLE_FAILURE',
+            },
+            reason: holdReason,
+            correlationId,
+            nowMs: errNow,
+          });
+
+          await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+          return { outcome: 'RETRYABLE_FAILURE' };
+        }
+
+        // At least one active started SUPER_ADMIN is available: mark primary group row PERMANENT_FAILURE
+        // and atomically enqueue EMERGENCY_SUPER_ADMIN_FALLBACK DMs with full masked context.
+        const markedPerm = await outboxRepository.markPermanentFailure(env.DB, {
+          outbox: claimed,
+          leaseToken,
+          errorMsg: errMsg,
+          nowMs: errNow,
+        });
+
+        if (!markedPerm) {
+          logger.log({
+            level: 'WARN',
+            event: 'OUTBOX_LEASE_LOST_BEFORE_PERMANENT_FAILURE',
+            correlationId,
+            outboxId,
+          });
+          await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+          return { outcome: 'SKIPPED' };
+        }
+
+        await auditRepository.appendImmediate(env.DB, {
+          actorId: leaseOwner,
+          actorRole: 'SYSTEM',
+          action: 'OUTBOX_PERMANENT_FAILURE',
+          resourceType: 'OUTBOX',
+          resourceId: outboxId,
+          result: 'FAILURE',
+          afterState: { targetChatId: claimed.target_chat_id, eventType: claimed.event_type },
+          reason: errMsg,
+          correlationId,
+          nowMs: errNow,
+        });
+
+        const fallbackStmts = [];
+        const fallbackPayloads: OutboxQueuePayload[] = [];
+        const originalText = typeof payload.text === 'string' ? payload.text : '';
+        const originalReplyMarkup =
+          typeof payload.reply_markup === 'object' && payload.reply_markup !== null
+            ? (payload.reply_markup as Record<string, unknown>)
+            : undefined;
+
+        for (const sa of superAdmins) {
+          const fallbackBody = originalText
+            ? `🚨 <b>EMERGENCY ADMIN GROUP DELIVERY FAILURE</b>\nCould not deliver alert <code>${escapeHtml(outboxId)}</code> to group <code>${escapeHtml(claimed.target_chat_id)}</code>.\nError: <code>${escapeHtml(errMsg)}</code>\n\n${originalText}`
+            : `🚨 <b>EMERGENCY ADMIN GROUP DELIVERY FAILURE</b>\nCould not deliver alert <code>${escapeHtml(outboxId)}</code> to group <code>${escapeHtml(claimed.target_chat_id)}</code>.\nError: <code>${escapeHtml(errMsg)}</code>`;
+
+          const staged = outboxService.prepareChunkedTextOutbox(env.DB, {
+            baseOutboxId: generatePrefixedId('obx', errNow),
+            baseIdempotencyKey: `emerg_sa_fallback:${outboxId}:${sa.telegram_user_id}`,
+            eventType: 'EMERGENCY_SUPER_ADMIN_FALLBACK',
+            aggregateType: 'SYSTEM',
+            aggregateId: outboxId,
+            targetChatId: sa.telegram_user_id,
+            orderingKey: `emerg_sa_fallback:${outboxId}:${sa.telegram_user_id}`,
+            text: fallbackBody,
+            parseMode: 'HTML',
+            replyMarkup: originalReplyMarkup,
+            relatedTicketId: claimed.related_ticket_id,
+            correlationId,
+            nowMs: errNow,
+          });
+          fallbackStmts.push(...staged.statements);
+          fallbackPayloads.push(...staged.queuePayloads);
+        }
+
+        if (fallbackStmts.length > 0) {
+          await executeAtomicBatch(env.DB, fallbackStmts);
+          await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, fallbackPayloads);
+        }
+
+        await finalizeQueueEventGuard(env, queueEventId, leaseToken, 'ABORTED', errNow);
+        return { outcome: 'PERMANENT_FAILURE' };
+      }
+
+      // Non-group permanent failure (e.g., customer or admin DM 400/403 bot blocked)
       const markedPerm = await outboxRepository.markPermanentFailure(env.DB, {
         outbox: claimed,
         leaseToken,
@@ -475,35 +654,56 @@ export const outboxConsumer = {
         nowMs: errNow,
       });
 
-      // Emergency SUPER_ADMIN DM Fallback if delivery to TELEGRAM_ADMIN_GROUP_ID failed permanently
-      if (
-        claimed.target_chat_id === env.TELEGRAM_ADMIN_GROUP_ID &&
-        (claimed.event_type === 'GROUP_ALERT' || err instanceof PermanentProcessingError)
-      ) {
-        const superAdmins = await adminRepository.listActiveSuperAdmins(env.DB);
-        const fallbackStmts = [];
-        const fallbackPayloads: OutboxQueuePayload[] = [];
+      // If this row was an EMERGENCY_SUPER_ADMIN_FALLBACK DM and ALL sibling fallback DMs for the original
+      // group alert also failed permanently, reopen the original group alert to RETRYABLE_FAILURE so the
+      // notification is never silently lost when every Super Admin DM fails.
+      if (claimed.event_type === 'EMERGENCY_SUPER_ADMIN_FALLBACK' && claimed.aggregate_id) {
+        const remainingOrSucceededSiblings = await env.DB
+          .prepare(
+            `SELECT COUNT(*) AS cnt FROM outbox
+             WHERE event_type = 'EMERGENCY_SUPER_ADMIN_FALLBACK'
+               AND aggregate_id = ?1
+               AND status IN ('SENT', 'PENDING', 'CLAIMED', 'SENDING', 'RETRYABLE_FAILURE')`
+          )
+          .bind(claimed.aggregate_id)
+          .first<{ cnt: number }>();
 
-        for (const sa of superAdmins) {
-          const staged = outboxService.prepareChunkedTextOutbox(env.DB, {
-            baseOutboxId: generatePrefixedId('obx', errNow),
-            baseIdempotencyKey: `emerg_sa_fallback:${outboxId}:${sa.telegram_user_id}`,
-            eventType: 'EMERGENCY_SUPER_ADMIN_FALLBACK',
-            aggregateType: 'SYSTEM',
-            aggregateId: outboxId,
-            targetChatId: sa.telegram_user_id,
-            text: `🚨 <b>EMERGENCY ADMIN GROUP DELIVERY FAILURE</b>\nCould not deliver alert <code>${escapeHtml(outboxId)}</code> to group <code>${escapeHtml(claimed.target_chat_id)}</code>.\nError: <code>${escapeHtml(errMsg)}</code>`,
-            parseMode: 'HTML',
-            correlationId,
+        if ((remainingOrSucceededSiblings?.cnt ?? 0) === 0) {
+          const holdReason = `ALL_SUPER_ADMIN_FALLBACK_DMS_FAILED: ${errMsg}`;
+          const reopened = await outboxRepository.reopenFailedAdminOutboxForRecovery(env.DB, {
+            outboxId: claimed.aggregate_id,
+            nextAvailableAt: errNow + 60000,
+            errorMsg: holdReason,
             nowMs: errNow,
           });
-          fallbackStmts.push(...staged.statements);
-          fallbackPayloads.push(...staged.queuePayloads);
-        }
-
-        if (fallbackStmts.length > 0) {
-          await executeAtomicBatch(env.DB, fallbackStmts);
-          await outboxService.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, fallbackPayloads);
+          if (reopened) {
+            logger.log({
+              level: 'ERROR',
+              event: 'ADMIN_NOTIFICATION_NO_REACHABLE_ADMIN',
+              correlationId,
+              outboxId: claimed.aggregate_id,
+              ticketId: claimed.related_ticket_id,
+              metadata: {
+                failedFallbackOutboxId: outboxId,
+                heldStatus: 'RETRYABLE_FAILURE',
+              },
+            });
+            await auditRepository.appendImmediate(env.DB, {
+              actorId: leaseOwner,
+              actorRole: 'SYSTEM',
+              action: 'ADMIN_NOTIFICATION_HELD_NO_REACHABLE_ADMIN',
+              resourceType: 'OUTBOX',
+              resourceId: claimed.aggregate_id,
+              result: 'FAILURE',
+              afterState: {
+                failedFallbackOutboxId: outboxId,
+                heldStatus: 'RETRYABLE_FAILURE',
+              },
+              reason: holdReason,
+              correlationId,
+              nowMs: errNow,
+            });
+          }
         }
       }
 

@@ -589,4 +589,113 @@ export const outboxRepository = {
   async getById(db: D1Database, outboxId: string): Promise<OutboxRow | null> {
     return db.prepare('SELECT * FROM outbox WHERE outbox_id = ?1').bind(outboxId).first<OutboxRow>();
   },
+
+  async holdForAdminRecovery(
+    db: D1Database,
+    params: {
+      outbox: OutboxRow;
+      leaseToken: string;
+      nextAvailableAt: number;
+      errorMsg: string;
+      nowMs: number;
+    }
+  ): Promise<boolean> {
+    const cappedAttemptCount = Math.min(
+      params.outbox.attempt_count,
+      Math.max(1, params.outbox.max_attempts - 1)
+    );
+    const res = await db
+      .prepare(
+        `UPDATE outbox
+         SET status = 'RETRYABLE_FAILURE',
+             attempt_count = ?3,
+             available_at = ?4,
+             next_dispatch_at = ?4,
+             last_error = ?5,
+             lease_owner = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?6
+         WHERE outbox_id = ?1
+           AND status = 'SENDING'
+           AND lease_token = ?2
+           AND lease_expires_at > ?6`
+      )
+      .bind(
+        params.outbox.outbox_id,
+        params.leaseToken,
+        cappedAttemptCount,
+        params.nextAvailableAt,
+        params.errorMsg.slice(0, 500),
+        params.nowMs
+      )
+      .run();
+    return res.meta.changes === 1;
+  },
+
+  async reopenFailedAdminOutboxForRecovery(
+    db: D1Database,
+    params: {
+      outboxId: string;
+      nextAvailableAt: number;
+      errorMsg: string;
+      nowMs: number;
+    }
+  ): Promise<boolean> {
+    const res = await db
+      .prepare(
+        `UPDATE outbox
+         SET status = 'RETRYABLE_FAILURE',
+             attempt_count = CASE WHEN max_attempts > 1 THEN max_attempts - 1 ELSE 1 END,
+             available_at = ?2,
+             next_dispatch_at = ?2,
+             last_error = ?3,
+             lease_owner = NULL,
+             lease_token = NULL,
+             lease_expires_at = NULL,
+             updated_at = ?4
+         WHERE outbox_id = ?1
+           AND status = 'PERMANENT_FAILURE'`
+      )
+      .bind(params.outboxId, params.nextAvailableAt, params.errorMsg.slice(0, 500), params.nowMs)
+      .run();
+    return res.meta.changes === 1;
+  },
+
+  async healUnconfiguredTargetChatId(
+    db: D1Database,
+    params: {
+      outboxId: string;
+      newTargetChatId: string;
+      nowMs: number;
+    }
+  ): Promise<OutboxRow | null> {
+    const existing = await this.getById(db, params.outboxId);
+    if (!existing || (existing.status !== 'PENDING' && existing.status !== 'RETRYABLE_FAILURE')) {
+      return null;
+    }
+    let updatedPayloadJson = existing.payload_json;
+    try {
+      const parsed = JSON.parse(existing.payload_json) as Record<string, unknown>;
+      parsed.chat_id = params.newTargetChatId;
+      updatedPayloadJson = JSON.stringify(parsed);
+    } catch {
+      // keep existing payload_json if malformed
+    }
+    return db
+      .prepare(
+        `UPDATE outbox
+         SET target_chat_id = ?2,
+             ordering_key = ?2,
+             payload_json = ?3,
+             available_at = ?4,
+             next_dispatch_at = ?4,
+             updated_at = ?4
+         WHERE outbox_id = ?1
+           AND status IN ('PENDING', 'RETRYABLE_FAILURE')
+         RETURNING *`
+      )
+      .bind(params.outboxId, params.newTargetChatId, updatedPayloadJson, params.nowMs)
+      .first<OutboxRow>();
+  },
 };

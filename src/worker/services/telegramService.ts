@@ -17,18 +17,173 @@ interface TelegramApiResponse {
   parameters?: { retry_after?: number };
 }
 
+export type TelegramApiMethod =
+  | 'sendMessage'
+  | 'sendPhoto'
+  | 'sendDocument'
+  | 'editMessageText'
+  | 'answerCallbackQuery'
+  | 'getMe'
+  | 'getChatMember';
+
+const PLACEHOLDER_CREDENTIAL_OR_ID_REGEX =
+  /^(?:CONFIGURED_IN_CLOUDFLARE_ENV|PENDING_OWNER_[A-Z0-9_]*|PLACEHOLDER[A-Z0-9_]*|CHANGE_ME[A-Z0-9_]*|REPLACE_ME[A-Z0-9_]*|YOUR_[A-Z0-9_]*|TODO[A-Z0-9_]*|EXAMPLE[A-Z0-9_]*|<[^>]+>)$/i;
+
+export function isPlaceholderTelegramValue(value: unknown): boolean {
+  if (typeof value !== 'string' && typeof value !== 'number') {
+    return true;
+  }
+  const trimmed = String(value).trim();
+  if (!trimmed) {
+    return true;
+  }
+  return PLACEHOLDER_CREDENTIAL_OR_ID_REGEX.test(trimmed);
+}
+
+export function isValidTelegramChatId(chatId: unknown): boolean {
+  if (typeof chatId !== 'string' && typeof chatId !== 'number') {
+    return false;
+  }
+  const trimmed = String(chatId).trim();
+  if (!trimmed || trimmed === 'UNCONFIGURED_ADMIN_GROUP_CHAT') {
+    return false;
+  }
+  if (PLACEHOLDER_CREDENTIAL_OR_ID_REGEX.test(trimmed)) {
+    return false;
+  }
+  return true;
+}
+
+function isValidPositiveIntegerId(value: unknown): boolean {
+  if (typeof value === 'number') {
+    return Number.isInteger(value) && value > 0;
+  }
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    return /^\d+$/.test(trimmed) && Number(trimmed) > 0;
+  }
+  return false;
+}
+
+function validateTelegramMethodPayload(
+  method: TelegramApiMethod,
+  payload: Record<string, unknown>
+): void {
+  switch (method) {
+    case 'sendMessage': {
+      if (!isValidTelegramChatId(payload.chat_id)) {
+        throw new PermanentProcessingError('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+      }
+      if (typeof payload.text !== 'string' || payload.text.trim().length === 0) {
+        throw new PermanentProcessingError('TELEGRAM_MESSAGE_TEXT_REQUIRED');
+      }
+      return;
+    }
+    case 'sendPhoto': {
+      if (!isValidTelegramChatId(payload.chat_id)) {
+        throw new PermanentProcessingError('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+      }
+      if (
+        typeof payload.photo !== 'string' ||
+        payload.photo.trim().length === 0 ||
+        isPlaceholderTelegramValue(payload.photo)
+      ) {
+        throw new PermanentProcessingError('TELEGRAM_PHOTO_REQUIRED');
+      }
+      return;
+    }
+    case 'sendDocument': {
+      if (!isValidTelegramChatId(payload.chat_id)) {
+        throw new PermanentProcessingError('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+      }
+      if (
+        typeof payload.document !== 'string' ||
+        payload.document.trim().length === 0 ||
+        isPlaceholderTelegramValue(payload.document)
+      ) {
+        throw new PermanentProcessingError('TELEGRAM_DOCUMENT_REQUIRED');
+      }
+      return;
+    }
+    case 'editMessageText': {
+      if (typeof payload.text !== 'string' || payload.text.trim().length === 0) {
+        throw new PermanentProcessingError('TELEGRAM_MESSAGE_TEXT_REQUIRED');
+      }
+      const hasInlineMessageId =
+        payload.inline_message_id !== undefined &&
+        payload.inline_message_id !== null &&
+        String(payload.inline_message_id).trim().length > 0;
+
+      if (hasInlineMessageId) {
+        if (isPlaceholderTelegramValue(payload.inline_message_id)) {
+          throw new PermanentProcessingError('TELEGRAM_INLINE_MESSAGE_ID_INVALID');
+        }
+        if (
+          payload.chat_id !== undefined &&
+          payload.chat_id !== null &&
+          String(payload.chat_id).trim().length > 0 &&
+          !isValidTelegramChatId(payload.chat_id)
+        ) {
+          throw new PermanentProcessingError('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+        }
+        return;
+      }
+
+      if (!isValidTelegramChatId(payload.chat_id)) {
+        throw new PermanentProcessingError('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+      }
+      if (!isValidPositiveIntegerId(payload.message_id)) {
+        throw new PermanentProcessingError('TELEGRAM_MESSAGE_ID_REQUIRED');
+      }
+      return;
+    }
+    case 'answerCallbackQuery': {
+      if (
+        typeof payload.callback_query_id !== 'string' ||
+        payload.callback_query_id.trim().length === 0 ||
+        isPlaceholderTelegramValue(payload.callback_query_id)
+      ) {
+        throw new PermanentProcessingError('TELEGRAM_CALLBACK_QUERY_ID_REQUIRED');
+      }
+      return;
+    }
+    case 'getMe': {
+      return;
+    }
+    case 'getChatMember': {
+      if (!isValidTelegramChatId(payload.chat_id)) {
+        throw new PermanentProcessingError('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+      }
+      if (!isValidPositiveIntegerId(payload.user_id)) {
+        throw new PermanentProcessingError('TELEGRAM_USER_ID_REQUIRED');
+      }
+      return;
+    }
+  }
+}
+
 export const telegramService = {
   async callApi(
     botToken: string,
-    method: 'sendMessage' | 'sendPhoto' | 'editMessageText' | 'answerCallbackQuery',
+    method: TelegramApiMethod,
     payload: Record<string, unknown>,
     timeoutMs = 10000
   ): Promise<TelegramApiSuccessResult> {
-    if (!botToken || botToken.trim().length < 10) {
+    if (
+      !botToken ||
+      botToken.trim().length < 10 ||
+      isPlaceholderTelegramValue(botToken)
+    ) {
       throw new PermanentProcessingError('TELEGRAM_BOT_TOKEN_NOT_CONFIGURED');
     }
 
-    const isIdempotentMethod = method === 'editMessageText' || method === 'answerCallbackQuery';
+    validateTelegramMethodPayload(method, payload);
+
+    const isIdempotentMethod =
+      method === 'editMessageText' ||
+      method === 'answerCallbackQuery' ||
+      method === 'getMe' ||
+      method === 'getChatMember';
     const url = `https://api.telegram.org/bot${botToken}/${method}`;
     let response: Response;
 

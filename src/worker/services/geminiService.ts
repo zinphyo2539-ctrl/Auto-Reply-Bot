@@ -68,7 +68,14 @@ export const geminiService = {
       throw new ExternalServiceError('AI_GLOBALLY_DISABLED', { retryable: false, code: 'AI_DISABLED' });
     }
 
-    if (!params.apiKey || params.apiKey.trim().length < 10 || params.apiKey === 'MY_GEMINI_API_KEY') {
+    if (
+      !params.apiKey ||
+      params.apiKey.trim().length < 10 ||
+      params.apiKey === 'MY_GEMINI_API_KEY' ||
+      /^(CONFIGURED_IN_CLOUDFLARE_ENV|PENDING_OWNER_CONFIRMATION|PENDING_OWNER_CONFIGURATION|<.*>|CHANGE_ME.*|REPLACE_ME.*)$/i.test(
+        params.apiKey.trim()
+      )
+    ) {
       throw new ExternalServiceError('GEMINI_API_KEY_NOT_CONFIGURED', {
         retryable: false,
         code: 'GEMINI_KEY_MISSING',

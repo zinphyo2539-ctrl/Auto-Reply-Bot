@@ -81,6 +81,8 @@ export const scheduledDispatcher = {
       }
     }
 
+    const recoveryRes = await outboxService.recoverHeldAdminNotifications(env, nowMs, correlationId);
+
     const dueRows = await outboxRepository.claimDueForCronDispatch(env.DB, nowMs, 30);
     if (dueRows.length > 0) {
       const payloads: OutboxQueuePayload[] = dueRows.map((r) => ({
@@ -96,7 +98,7 @@ export const scheduledDispatcher = {
     return {
       expiredClaimedRecovered,
       expiredSendingMarkedUncertain,
-      requeuedCount: dueRows.length,
+      requeuedCount: dueRows.length + recoveryRes.releasedForDispatchCount,
     };
   },
 

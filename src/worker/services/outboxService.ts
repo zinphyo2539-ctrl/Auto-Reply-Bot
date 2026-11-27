@@ -1,6 +1,10 @@
-import type { D1Database, D1PreparedStatement, OutboxQueuePayload, QueueProducer } from '../types/bindings';
+import type { D1Database, D1PreparedStatement, Env, OutboxQueuePayload, QueueProducer } from '../types/bindings';
+import type { OutboxRow } from '../types/domain';
 import { outboxRepository, type EnqueueOutboxSpec } from '../repositories/outboxRepository';
+import { adminRepository } from '../repositories/adminRepository';
+import { isValidTelegramChatId } from './telegramService';
 import { chunkTelegramText } from '../lib/textChunker';
+import { generatePrefixedId } from '../lib/ids';
 import { logger } from '../lib/logger';
 
 export interface StagedOutboxBatch {
@@ -18,6 +22,7 @@ export const outboxService = {
       aggregateType: EnqueueOutboxSpec['aggregateType'];
       aggregateId: string;
       targetChatId: string;
+      orderingKey?: string;
       text: string;
       parseMode?: 'HTML';
       replyMarkup?: Record<string, unknown>;
@@ -29,6 +34,10 @@ export const outboxService = {
       customerModeGate?: EnqueueOutboxSpec['customerModeGate'];
     }
   ): StagedOutboxBatch {
+    const safeTargetChatId = isValidTelegramChatId(params.targetChatId)
+      ? params.targetChatId.trim()
+      : 'UNCONFIGURED_ADMIN_GROUP_CHAT';
+    const effectiveOrderingKey = params.orderingKey?.trim() || safeTargetChatId;
     const chunks = chunkTelegramText(params.text, 3800);
     const statements: D1PreparedStatement[] = [];
     const queuePayloads: OutboxQueuePayload[] = [];
@@ -41,7 +50,7 @@ export const outboxService = {
         chunks.length === 1 ? params.baseIdempotencyKey : `${params.baseIdempotencyKey}:c${seq}`;
 
       const payload: Record<string, unknown> = {
-        chat_id: params.targetChatId,
+        chat_id: safeTargetChatId,
         text: chunkText,
         link_preview_options: { is_disabled: true },
       };
@@ -60,8 +69,8 @@ export const outboxService = {
           eventType: params.eventType,
           aggregateType: params.aggregateType,
           aggregateId: params.aggregateId,
-          targetChatId: params.targetChatId,
-          orderingKey: params.targetChatId,
+          targetChatId: safeTargetChatId,
+          orderingKey: effectiveOrderingKey,
           sequenceNo: seq,
           telegramMethod: 'sendMessage',
           payload,
@@ -77,7 +86,7 @@ export const outboxService = {
       queuePayloads.push({
         eventId: `qev_${outboxId}_att_1`,
         outboxId,
-        orderingKey: params.targetChatId,
+        orderingKey: effectiveOrderingKey,
         sequenceNo: seq,
         correlationId: params.correlationId,
       });
@@ -126,5 +135,99 @@ export const outboxService = {
         metadata: { count: payloads.length },
       });
     }
+  },
+
+  /**
+   * Operational Recovery Path for Held Admin Notifications:
+   * Invoked when a SUPER_ADMIN runs /start in private chat or by the 1-minute lease recovery cron.
+   * - If TELEGRAM_ADMIN_GROUP_ID is now configured with a valid chat ID, heals any pending/held
+   *   'UNCONFIGURED_ADMIN_GROUP_CHAT' outbox rows to target the real group chat ID.
+   * - If at least one active started SUPER_ADMIN is now available, wakes any held admin outbox rows
+   *   so outboxConsumer can immediately deliver them via EMERGENCY_SUPER_ADMIN_FALLBACK.
+   */
+  async recoverHeldAdminNotifications(
+    env: Env,
+    nowMs: number,
+    correlationId = generatePrefixedId('rec', nowMs)
+  ): Promise<{ healedGroupTargetCount: number; releasedForDispatchCount: number }> {
+    const hasValidGroup = isValidTelegramChatId(env.TELEGRAM_ADMIN_GROUP_ID);
+    const configuredGroupId = hasValidGroup ? env.TELEGRAM_ADMIN_GROUP_ID.trim() : null;
+    const activeStartedSuperAdmins = await adminRepository.listActiveSuperAdmins(env.DB);
+
+    if (!configuredGroupId && activeStartedSuperAdmins.length === 0) {
+      return { healedGroupTargetCount: 0, releasedForDispatchCount: 0 };
+    }
+
+    const heldCandidates = await env.DB
+      .prepare(
+        `SELECT * FROM outbox
+         WHERE status IN ('PENDING', 'RETRYABLE_FAILURE')
+           AND (
+             target_chat_id = 'UNCONFIGURED_ADMIN_GROUP_CHAT'
+             OR last_error LIKE 'ADMIN_NOTIFICATION_CHANNEL_UNAVAILABLE%'
+             OR last_error LIKE 'ALL_SUPER_ADMIN_FALLBACK_DMS_FAILED%'
+           )
+         ORDER BY created_at ASC
+         LIMIT 30`
+      )
+      .all<OutboxRow>();
+
+    let healedGroupTargetCount = 0;
+    const payloads: OutboxQueuePayload[] = [];
+
+    for (const row of heldCandidates.results) {
+      if (configuredGroupId && row.target_chat_id === 'UNCONFIGURED_ADMIN_GROUP_CHAT') {
+        const healed = await outboxRepository.healUnconfiguredTargetChatId(env.DB, {
+          outboxId: row.outbox_id,
+          newTargetChatId: configuredGroupId,
+          nowMs,
+        });
+        if (healed) {
+          healedGroupTargetCount++;
+          payloads.push({
+            eventId: generatePrefixedId('qev', nowMs),
+            outboxId: healed.outbox_id,
+            orderingKey: healed.ordering_key,
+            sequenceNo: healed.sequence_no,
+            correlationId,
+          });
+          continue;
+        }
+      }
+
+      if (activeStartedSuperAdmins.length > 0 || configuredGroupId) {
+        const woke = await env.DB
+          .prepare(
+            `UPDATE outbox
+             SET available_at = ?2,
+                 next_dispatch_at = ?2,
+                 updated_at = ?2
+             WHERE outbox_id = ?1
+               AND status IN ('PENDING', 'RETRYABLE_FAILURE')
+             RETURNING *`
+          )
+          .bind(row.outbox_id, nowMs)
+          .first<OutboxRow>();
+
+        if (woke) {
+          payloads.push({
+            eventId: generatePrefixedId('qev', nowMs),
+            outboxId: woke.outbox_id,
+            orderingKey: woke.ordering_key,
+            sequenceNo: woke.sequence_no,
+            correlationId,
+          });
+        }
+      }
+    }
+
+    if (payloads.length > 0) {
+      await this.dispatchQueueSignalsBestEffort(env.OUTBOX_QUEUE, payloads);
+    }
+
+    return {
+      healedGroupTargetCount,
+      releasedForDispatchCount: payloads.length,
+    };
   },
 };

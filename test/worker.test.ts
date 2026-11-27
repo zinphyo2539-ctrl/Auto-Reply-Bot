@@ -10,6 +10,7 @@ import { depositService } from '../src/worker/services/depositService';
 import { withdrawalService } from '../src/worker/services/withdrawalService';
 import { customerService } from '../src/worker/services/customerService';
 import { adminService } from '../src/worker/services/adminService';
+import { telegramService } from '../src/worker/services/telegramService';
 import { outboxConsumer } from '../src/worker/queues/outboxConsumer';
 import { scheduledDispatcher } from '../src/worker/scheduled/dispatcher';
 import { auditRepository } from '../src/worker/repositories/auditRepository';
@@ -25,6 +26,15 @@ import { encodeCallbackData, decodeCallbackData } from '../src/worker/lib/callba
 import { chunkTelegramText, escapeHtml } from '../src/worker/lib/textChunker';
 import { redactLogObject } from '../src/worker/lib/logger';
 import { containsForbiddenFinancialCommitment } from '../src/worker/schemas/geminiSchemas';
+import {
+  DASHBOARD_MANAGED_VAR_KEYS,
+  OPTIONAL_ROTATION_SECRET_KEYS,
+  REQUIRED_SECRET_KEYS,
+  REQUIRED_STATIC_VAR_KEYS,
+  enforceDeploymentGate,
+  validateWranglerDeploymentConfig,
+  type WranglerRootConfig,
+} from '../src/worker/lib/deploymentGuard';
 
 const MIGRATIONS_DIR = path.resolve(process.cwd(), 'migrations');
 
@@ -1570,27 +1580,62 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(ret.expiredAuditLogsDeleted).toBe(1);
   });
 
-  // 25. Cloudflare wrangler.jsonc & .env.example Configuration Parity
-  it('25. Verifies wrangler.jsonc staging/production explicit cron triggers and .env.example config parity', () => {
+  // 25. Cloudflare wrangler.jsonc (Architecture B + Dashboard-Managed Variables) & .env.example Configuration Parity
+  it('25. Verifies Architecture B top-level staging config, keep_vars: true, Dashboard-managed vars omission, cron triggers, and .env.example parity', () => {
     const wranglerRaw = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.jsonc'), 'utf8');
-    const wranglerCfg = JSON.parse(wranglerRaw) as {
-      triggers: { crons: string[] };
-      env: {
-        staging: { triggers?: { crons: string[] }; vars: Record<string, string> };
-        production: { triggers?: { crons: string[] }; vars: Record<string, string> };
-      };
-    };
+    const wranglerCfg = JSON.parse(wranglerRaw) as WranglerRootConfig;
+
+    // 1. Top-level Architecture B temporary staging identity & keep_vars: true
+    expect(wranglerCfg.name).toBe('auto-reply-bot');
+    expect(wranglerCfg.keep_vars).toBe(true);
+
+    // 2. keep_vars must NOT be placed inside named environments
+    expect(wranglerCfg.env?.staging).toBeDefined();
+    expect(wranglerCfg.env?.production).toBeDefined();
+    expect(wranglerCfg.env?.staging).not.toHaveProperty('keep_vars');
+    expect(wranglerCfg.env?.production).not.toHaveProperty('keep_vars');
+
+    // 3. Top-level environment is explicitly staging for Architecture B
+    expect(wranglerCfg.vars?.ENVIRONMENT).toBe('staging');
+    expect(wranglerCfg.env?.staging?.vars?.ENVIRONMENT).toBe('staging');
+    expect(wranglerCfg.env?.production?.vars?.ENVIRONMENT).toBe('production');
+
+    // 4. The three Dashboard-managed variables are omitted from every Wrangler vars block
+    const allVarsBlocks = [
+      wranglerCfg.vars ?? {},
+      wranglerCfg.env?.staging?.vars ?? {},
+      wranglerCfg.env?.production?.vars ?? {},
+    ];
+    for (const varsBlock of allVarsBlocks) {
+      for (const dashboardKey of DASHBOARD_MANAGED_VAR_KEYS) {
+        expect(varsBlock).not.toHaveProperty(dashboardKey);
+      }
+      for (const secretKey of [...REQUIRED_SECRET_KEYS, ...OPTIONAL_ROTATION_SECRET_KEYS]) {
+        expect(varsBlock).not.toHaveProperty(secretKey);
+      }
+      // No CONFIGURED_IN_CLOUDFLARE_ENV or PENDING_OWNER_* placeholder value deployed as a variable
+      for (const val of Object.values(varsBlock)) {
+        expect(String(val)).not.toMatch(/CONFIGURED_IN_CLOUDFLARE_ENV|PENDING_OWNER_CONFIRMATION|PENDING_OWNER_CONFIGURATION/i);
+      }
+      // All 10 static configuration variables exist
+      for (const staticKey of REQUIRED_STATIC_VAR_KEYS) {
+        expect(typeof varsBlock[staticKey]).toBe('string');
+        expect(String(varsBlock[staticKey]).trim().length).toBeGreaterThan(0);
+      }
+    }
 
     const expectedCrons = ['* * * * *', '*/5 * * * *', '0 20 * * *'];
-    expect(wranglerCfg.triggers.crons).toEqual(expectedCrons);
-    expect(wranglerCfg.env.staging.triggers?.crons).toEqual(expectedCrons);
-    expect(wranglerCfg.env.production.triggers?.crons).toEqual(expectedCrons);
+    expect(wranglerCfg.triggers?.crons).toEqual(expectedCrons);
+    expect(wranglerCfg.env?.staging?.triggers?.crons).toEqual(expectedCrons);
+    expect(wranglerCfg.env?.production?.triggers?.crons).toEqual(expectedCrons);
 
     // Ensure removed unused SLA env vars are gone
-    expect(wranglerCfg.env.staging.vars).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
-    expect(wranglerCfg.env.staging.vars).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
+    expect(wranglerCfg.vars).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
+    expect(wranglerCfg.vars).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
+    expect(wranglerCfg.env?.staging?.vars).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
+    expect(wranglerCfg.env?.staging?.vars).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
 
-    // Parse .env.example non-secret vars and verify retention defaults match wrangler.jsonc staging
+    // Parse .env.example non-secret vars and verify retention defaults & required secret declarations
     const envExampleRaw = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
     const envMap: Record<string, string> = {};
     for (const line of envExampleRaw.split('\n')) {
@@ -1604,25 +1649,33 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
 
     expect(envMap).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
     expect(envMap).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
-    expect(envMap.RETENTION_MESSAGES_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_MESSAGES_DAYS);
-    expect(envMap.RETENTION_FINGERPRINTS_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_FINGERPRINTS_DAYS);
-    expect(envMap.RETENTION_AUDIT_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_AUDIT_DAYS);
-    expect(envMap.RETENTION_WITHDRAWAL_PII_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_WITHDRAWAL_PII_DAYS);
-    expect(envMap.RETENTION_OUTBOX_DAYS).toBe(wranglerCfg.env.staging.vars.RETENTION_OUTBOX_DAYS);
-    // Ensure .env.example uses non-production placeholders rather than fake numeric IDs or candidate handle
+    expect(envMap.RETENTION_MESSAGES_DAYS).toBe(wranglerCfg.vars?.RETENTION_MESSAGES_DAYS);
+    expect(envMap.RETENTION_FINGERPRINTS_DAYS).toBe(wranglerCfg.vars?.RETENTION_FINGERPRINTS_DAYS);
+    expect(envMap.RETENTION_AUDIT_DAYS).toBe(wranglerCfg.vars?.RETENTION_AUDIT_DAYS);
+    expect(envMap.RETENTION_WITHDRAWAL_PII_DAYS).toBe(wranglerCfg.vars?.RETENTION_WITHDRAWAL_PII_DAYS);
+    expect(envMap.RETENTION_OUTBOX_DAYS).toBe(wranglerCfg.vars?.RETENTION_OUTBOX_DAYS);
+
+    // Ensure .env.example documents Dashboard-managed variables with placeholders and all 6 required/optional Secret names with empty values
     expect(envMap.TELEGRAM_BOT_USERNAME).toBe('<TELEGRAM_BOT_USERNAME>');
     expect(envMap.TELEGRAM_ADMIN_GROUP_ID).toBe('<TELEGRAM_ADMIN_GROUP_ID>');
     expect(envMap.SUPER_ADMIN_IDS).toBe('<SUPER_ADMIN_TELEGRAM_USER_IDS>');
+    for (const reqSecret of REQUIRED_SECRET_KEYS) {
+      expect(envMap).toHaveProperty(reqSecret);
+      expect(envMap[reqSecret]).toBe('');
+    }
+    for (const optSecret of OPTIONAL_ROTATION_SECRET_KEYS) {
+      expect(envMap).toHaveProperty(optSecret);
+      expect(envMap[optSecret]).toBe('');
+    }
 
-    // Verify DLQ consumer bindings exist for staging and production with max_retries: 0
-    const fullCfg = wranglerCfg as unknown as {
-      env: {
-        staging: { queues: { consumers: Array<{ queue: string; max_retries: number }> } };
-        production: { queues: { consumers: Array<{ queue: string; max_retries: number }> } };
-      };
-    };
-    const stagingDlq = fullCfg.env.staging.queues.consumers.find((c) => c.queue === 'vip-outbox-dlq-staging');
-    const prodDlq = fullCfg.env.production.queues.consumers.find((c) => c.queue === 'vip-outbox-dlq-prod');
+    // Verify top-level, staging, and production D1 & Queue bindings (including DLQ max_retries: 0)
+    expect(wranglerCfg.d1_databases?.[0]?.binding).toBe('DB');
+    expect(wranglerCfg.queues?.producers?.[0]?.binding).toBe('OUTBOX_QUEUE');
+    const topDlq = wranglerCfg.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-staging');
+    const stagingDlq = wranglerCfg.env?.staging?.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-staging');
+    const prodDlq = wranglerCfg.env?.production?.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-prod');
+    expect(topDlq).toBeDefined();
+    expect(topDlq!.max_retries).toBe(0);
     expect(stagingDlq).toBeDefined();
     expect(stagingDlq!.max_retries).toBe(0);
     expect(prodDlq).toBeDefined();
@@ -2579,5 +2632,673 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(migAlert!.target_chat_id).toBe('9001');
     expect(migAlert!.payload_json).toContain('-1001122334455');
   });
+
+  // 36. Phase 3.3 5-State Deployment Readiness Gate, Live Worker Replacement Protection, & Cross-Environment Isolation
+  it('36. Enforces 5-state fail-closed deployment readiness gate (localConfigValid, stagingResourceReady, secretConfigReady, adminNotificationReady, deploymentAuthorized) and blocks unacknowledged live Worker replacement', () => {
+    const wranglerRaw = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.jsonc'), 'utf8');
+    const envExampleRaw = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
+    const currentRepoCfg = JSON.parse(wranglerRaw) as WranglerRootConfig;
+
+    // 1. Current repository config without external verification:
+    //    localConfigValid=true, but stagingResourceReady=false, secretConfigReady=false, adminNotificationReady=false, deploymentAuthorized=false
+    const repoCheck = validateWranglerDeploymentConfig(currentRepoCfg, {
+      targetEnv: 'top-level',
+      phaseMode: 'temporary_staging',
+      ciOverrideName: 'auto-reply-bot',
+      envExampleContent: envExampleRaw,
+    });
+    expect(repoCheck.localConfigValid).toBe(true);
+    expect(repoCheck.stagingResourceReady).toBe(false);
+    expect(repoCheck.secretConfigReady).toBe(false);
+    expect(repoCheck.adminNotificationReady).toBe(false);
+    expect(repoCheck.deploymentAuthorized).toBe(false);
+    expect(repoCheck.readyToDeploy).toBe(false);
+    expect(repoCheck.liveWorkerReplacementRisk).toBe(true);
+    expect(repoCheck.advisoryScope).toBe('LOCAL_REPOSITORY_CHECK_ONLY_NOT_REMOTE_CI_OR_IAM_LOCK');
+    expect(repoCheck.resolvedWorkerName).toBe('auto-reply-bot');
+    expect(repoCheck.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining([
+        'PLACEHOLDER_D1_DATABASE_ID',
+        'LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED',
+        'UNVERIFIED_EXTERNAL_STAGING_RESOURCES',
+        'UNVERIFIED_EXTERNAL_SECRETS',
+        'UNVERIFIED_ADMIN_NOTIFICATION_ROUTE',
+      ])
+    );
+
+    // 2. Empty externalVerification: {} must NOT produce false positives
+    const validUuid = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+    const readyCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
+    readyCfg.d1_databases![0].database_id = validUuid;
+    readyCfg.env!.staging.d1_databases![0].database_id = validUuid;
+
+    const emptyExternalRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'top-level',
+      phaseMode: 'temporary_staging',
+      ciOverrideName: 'auto-reply-bot',
+      envExampleContent: envExampleRaw,
+      externalVerification: {},
+    });
+    expect(emptyExternalRes.localConfigValid).toBe(true);
+    expect(emptyExternalRes.stagingResourceReady).toBe(false);
+    expect(emptyExternalRes.secretConfigReady).toBe(false);
+    expect(emptyExternalRes.adminNotificationReady).toBe(false);
+    expect(emptyExternalRes.readyToDeploy).toBe(false);
+
+    // 3. Root vs env.staging Worker identity collision (if env.staging.name === "auto-reply-bot") is rejected
+    const identityCollisionCfg: WranglerRootConfig = structuredClone(readyCfg);
+    identityCollisionCfg.env!.staging.name = 'auto-reply-bot';
+    const identityCollisionRes = validateWranglerDeploymentConfig(identityCollisionCfg);
+    expect(identityCollisionRes.localConfigValid).toBe(false);
+    expect(identityCollisionRes.issues.map((i) => i.code)).toContain('ROOT_STAGING_WORKER_IDENTITY_COLLISION');
+
+    // 4. Divergent top-level vs env.staging D1 database_id triggers STAGING_TOP_LEVEL_ENV_MISMATCH
+    const divergentStagingCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
+    divergentStagingCfg.d1_databases![0].database_id = validUuid;
+    const divergentRes = validateWranglerDeploymentConfig(divergentStagingCfg);
+    expect(divergentRes.stagingResourceReady).toBe(false);
+    expect(divergentRes.issues.map((i) => i.code)).toContain('STAGING_TOP_LEVEL_ENV_MISMATCH');
+
+    // 5. All external verification checks verified, but liveWorkerReplacementRisk not acknowledged -> still blocked!
+    const fullExternalVerification = {
+      stagingResources: {
+        d1DatabaseProvisioned: true,
+        d1MigrationsApplied: true,
+        primaryQueueProvisioned: true,
+        dlqProvisioned: true,
+      },
+      secrets: {
+        verifiedEncryptedSecretKeys: REQUIRED_SECRET_KEYS,
+        historicalPlaintextSecretsCleared: true,
+      },
+      adminNotification: {
+        dashboardVarsConfigured: true,
+        adminGroupVerified: true,
+        activeStartedSuperAdminVerified: true,
+        configuredAdminGroupId: '-100999888777',
+        configuredSuperAdminIds: '9001',
+      },
+    };
+    const unackReplacementRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'top-level',
+      phaseMode: 'temporary_staging',
+      ciOverrideName: 'auto-reply-bot',
+      envExampleContent: envExampleRaw,
+      externalVerification: fullExternalVerification,
+      acknowledgeLiveWorkerReplacementRisk: false,
+    });
+    expect(unackReplacementRes.localConfigValid).toBe(true);
+    expect(unackReplacementRes.stagingResourceReady).toBe(true);
+    expect(unackReplacementRes.secretConfigReady).toBe(true);
+    expect(unackReplacementRes.adminNotificationReady).toBe(true);
+    expect(unackReplacementRes.readyToDeploy).toBe(false);
+    expect(unackReplacementRes.issues.map((i) => i.code)).toEqual(['LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED']);
+
+    // 6. Full external verification + acknowledgeLiveWorkerReplacementRisk: true makes readyToDeploy=true while deploymentAuthorized remains false until explicitOwnerAuthorization=true
+    const readyRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'top-level',
+      phaseMode: 'temporary_staging',
+      ciOverrideName: 'auto-reply-bot',
+      envExampleContent: envExampleRaw,
+      externalVerification: fullExternalVerification,
+      acknowledgeLiveWorkerReplacementRisk: true,
+    });
+    expect(readyRes.localConfigValid).toBe(true);
+    expect(readyRes.stagingResourceReady).toBe(true);
+    expect(readyRes.secretConfigReady).toBe(true);
+    expect(readyRes.adminNotificationReady).toBe(true);
+    expect(readyRes.deploymentAuthorized).toBe(false);
+    expect(readyRes.readyToDeploy).toBe(true);
+    expect(readyRes.issues).toHaveLength(0);
+
+    // enforceDeploymentGate blocks deployment when explicitOwnerAuthorization is omitted
+    expect(() =>
+      enforceDeploymentGate(readyCfg, {
+        targetEnv: 'top-level',
+        phaseMode: 'temporary_staging',
+        ciOverrideName: 'auto-reply-bot',
+        envExampleContent: envExampleRaw,
+        externalVerification: fullExternalVerification,
+        acknowledgeLiveWorkerReplacementRisk: true,
+      })
+    ).toThrow(/DEPLOYMENT_NOT_AUTHORIZED/);
+
+    const authorizedGateRes = enforceDeploymentGate(readyCfg, {
+      targetEnv: 'top-level',
+      phaseMode: 'temporary_staging',
+      ciOverrideName: 'auto-reply-bot',
+      envExampleContent: envExampleRaw,
+      externalVerification: fullExternalVerification,
+      acknowledgeLiveWorkerReplacementRisk: true,
+      explicitOwnerAuthorization: true,
+    });
+    expect(authorizedGateRes.deploymentAuthorized).toBe(true);
+    expect(authorizedGateRes.readyToDeploy).toBe(true);
+
+    // 7. Rejects missing top-level keep_vars or keep_vars inside named environments
+    const badKeepVarsCfg: WranglerRootConfig = structuredClone(readyCfg);
+    badKeepVarsCfg.keep_vars = false;
+    badKeepVarsCfg.env!.staging.keep_vars = true;
+    const keepVarsRes = validateWranglerDeploymentConfig(badKeepVarsCfg);
+    expect(keepVarsRes.localConfigValid).toBe(false);
+    expect(keepVarsRes.readyToDeploy).toBe(false);
+    expect(keepVarsRes.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining(['MISSING_TOP_LEVEL_KEEP_VARS', 'INVALID_NAMED_ENV_KEEP_VARS'])
+    );
+
+    // 8. Rejects Dashboard-managed variables, unknown vars, or secrets in Wrangler vars, and detects historical plaintext secret bindings on Dashboard
+    const badVarsCfg: WranglerRootConfig = structuredClone(readyCfg);
+    badVarsCfg.vars = {
+      ...badVarsCfg.vars,
+      TELEGRAM_BOT_USERNAME: 'CONFIGURED_IN_CLOUDFLARE_ENV',
+      TELEGRAM_BOT_TOKEN: 'leaked_secret_in_vars',
+      UNKNOWN_UNCONSUMED_VAR: 'unexpected_value',
+    };
+    const badVarsRes = validateWranglerDeploymentConfig(badVarsCfg, {
+      dashboardPlaintextBindingKeys: ['GEMINI_API_KEY', 'TELEGRAM_WEBHOOK_SECRET'],
+      externalVerification: fullExternalVerification,
+    });
+    expect(badVarsRes.localConfigValid).toBe(false);
+    expect(badVarsRes.secretConfigReady).toBe(false);
+    expect(badVarsRes.readyToDeploy).toBe(false);
+    expect(badVarsRes.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining([
+        'DASHBOARD_MANAGED_VAR_IN_WRANGLER_VARS',
+        'PLACEHOLDER_VAR_VALUE',
+        'SECRET_IN_PLAINTEXT_VARS',
+        'UNCONSUMED_OR_UNKNOWN_VAR',
+        'HISTORICAL_PLAINTEXT_SECRET_BINDING',
+      ])
+    );
+
+    // 9. Rejects Staging vs Production D1 or Queue resource collision
+    const collisionCfg: WranglerRootConfig = structuredClone(readyCfg);
+    collisionCfg.env!.production.d1_databases![0].database_id = validUuid;
+    collisionCfg.env!.production.queues!.producers![0].queue = 'vip-outbox-queue-staging';
+    const collisionRes = validateWranglerDeploymentConfig(collisionCfg);
+    expect(collisionRes.stagingResourceReady).toBe(false);
+    expect(collisionRes.issues.map((i) => i.code)).toContain('STAGING_PRODUCTION_RESOURCE_COLLISION');
+
+    // 10. Rejects missing D1 bindings and missing Queue producer / consumers / DLQ
+    const missingBindingsCfg: WranglerRootConfig = structuredClone(readyCfg);
+    missingBindingsCfg.d1_databases = [];
+    missingBindingsCfg.queues = { producers: [], consumers: [] };
+    const missingBindingsRes = validateWranglerDeploymentConfig(missingBindingsCfg);
+    expect(missingBindingsRes.readyToDeploy).toBe(false);
+    expect(missingBindingsRes.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining(['MISSING_D1_BINDING', 'MISSING_QUEUE_PRODUCER'])
+    );
+
+    const missingDlqCfg: WranglerRootConfig = structuredClone(readyCfg);
+    missingDlqCfg.queues!.consumers = [
+      {
+        queue: 'vip-outbox-queue-staging',
+        max_batch_size: 10,
+        max_retries: 3,
+        dead_letter_queue: 'vip-outbox-dlq-staging',
+      },
+    ];
+    const missingDlqRes = validateWranglerDeploymentConfig(missingDlqCfg);
+    expect(missingDlqRes.readyToDeploy).toBe(false);
+    expect(missingDlqRes.issues.map((i) => i.code)).toContain('MISSING_DLQ_CONSUMER');
+
+    // 11. Rejects accidental production deployment or top-level ENVIRONMENT="production" or inconsistent Worker name during temporary staging phase
+    const accidentalProdTopCfg: WranglerRootConfig = structuredClone(readyCfg);
+    accidentalProdTopCfg.name = 'vip-gaming-bot';
+    accidentalProdTopCfg.vars!.ENVIRONMENT = 'production';
+    const accidentalProdTopRes = validateWranglerDeploymentConfig(accidentalProdTopCfg);
+    expect(accidentalProdTopRes.readyToDeploy).toBe(false);
+    expect(accidentalProdTopRes.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining([
+        'INCONSISTENT_WORKER_IDENTITY',
+        'TOP_LEVEL_NOT_STAGING_IN_ARCHITECTURE_B',
+      ])
+    );
+
+    const accidentalProdEnvRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'production',
+      phaseMode: 'temporary_staging',
+    });
+    expect(accidentalProdEnvRes.readyToDeploy).toBe(false);
+    expect(accidentalProdEnvRes.issues.map((i) => i.code)).toContain(
+      'PRODUCTION_BLOCKED_IN_TEMPORARY_STAGING_PHASE'
+    );
+
+    // 12. Rejects invalid environment selection and incompatible WRANGLER_CI_OVERRIDE_NAME
+    const invalidEnvRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'nonexistent_env',
+    });
+    expect(invalidEnvRes.readyToDeploy).toBe(false);
+    expect(invalidEnvRes.issues.map((i) => i.code)).toContain('INVALID_TARGET_ENVIRONMENT');
+
+    const ciMismatchRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'staging',
+      ciOverrideName: 'auto-reply-bot',
+    });
+    expect(ciMismatchRes.readyToDeploy).toBe(false);
+    expect(ciMismatchRes.issues.map((i) => i.code)).toContain('CI_OVERRIDE_NAME_MISMATCH');
+
+    const ciTopMismatchRes = validateWranglerDeploymentConfig(readyCfg, {
+      targetEnv: 'top-level',
+      ciOverrideName: 'different-worker-service',
+    });
+    expect(ciTopMismatchRes.readyToDeploy).toBe(false);
+    expect(ciTopMismatchRes.issues.map((i) => i.code)).toContain('CI_OVERRIDE_NAME_MISMATCH');
+  });
+
+  // 37. Phase 3.2/3.3 Runtime Fail-Safe Verification for Missing/Placeholder Secrets and Dashboard Variables
+  it('37. Fails closed on missing or placeholder secrets and handles missing Dashboard variables safely with emergency SUPER_ADMIN DM fallback', async () => {
+    const app = createApp();
+
+    // 1. Missing or placeholder TELEGRAM_WEBHOOK_SECRET fails closed with 401 even if attacker sends matching placeholder
+    for (const badWebhookSecret of ['', '   ', 'CONFIGURED_IN_CLOUDFLARE_ENV', '<TELEGRAM_WEBHOOK_SECRET>', 'PENDING_OWNER_CONFIGURATION']) {
+      const envBadWebhook: Env = {
+        ...env,
+        TELEGRAM_WEBHOOK_SECRET: badWebhookSecret,
+        TELEGRAM_WEBHOOK_SECRET_PREVIOUS: undefined,
+      };
+      const res = await app.fetch(
+        new Request('https://bot.example/webhook', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Telegram-Bot-Api-Secret-Token': badWebhookSecret || 'any_token',
+          },
+          body: JSON.stringify({ update_id: 99950 }),
+        }),
+        envBadWebhook
+      );
+      expect(res.status).toBe(401);
+    }
+
+    // 2. Missing or placeholder WITHDRAWAL_PII_ENCRYPTION_KEY fails closed before storing any withdrawal destination
+    await customerService.ensureActiveCustomer(env, {
+      customerId: '7901',
+      username: 'u7901',
+      firstName: 'SafeFailUser',
+    });
+    await withdrawalService.startWithdrawalWizard(env, '7901');
+    await withdrawalService.handleAmountInput(env, '7901', '20000');
+    await withdrawalService.handleMethodSelection(env, '7901', 'KBZPAY');
+
+    const envMissingAes: Env = { ...env, WITHDRAWAL_PII_ENCRYPTION_KEY: '' };
+    await expect(
+      withdrawalService.handleDestinationInput(envMissingAes, '7901', 'U Safe - 09451234567')
+    ).rejects.toThrow(/ENCRYPTION_KEY/i);
+
+    // 3. Placeholder GEMINI_API_KEY fails safely into human handover without making external HTTP calls
+    await db.prepare(`UPDATE config SET ai_enabled = 1 WHERE config_id = 'active'`).run();
+    const custAi = await customerService.ensureActiveCustomer(env, {
+      customerId: '7902',
+      username: 'u7902',
+      firstName: 'AiFailSafe',
+    });
+    let externalFetchCalled = false;
+    globalThis.fetch = vi.fn(async () => {
+      externalFetchCalled = true;
+      return new Response('{}', { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    const envPlaceholderGemini: Env = {
+      ...env,
+      GEMINI_API_KEY: 'CONFIGURED_IN_CLOUDFLARE_ENV',
+    };
+    await customerService.handleCustomerText(envPlaceholderGemini, {
+      customer: custAi,
+      telegramMessageId: 7902,
+      updateId: 99951,
+      text: 'Tell me about VIP bonuses',
+      correlationId: 'cor_gem_placeholder',
+    });
+    expect(externalFetchCalled).toBe(false);
+    const custAfterGemFail = await db
+      .prepare('SELECT chat_mode FROM customers WHERE telegram_user_id = ?1')
+      .bind('7902')
+      .first<{ chat_mode: string }>();
+    expect(custAfterGemFail!.chat_mode).toBe('HUMAN');
+
+    // 4. Missing Dashboard-managed TELEGRAM_ADMIN_GROUP_ID ("") does not crash deposit submission and triggers EMERGENCY_SUPER_ADMIN_FALLBACK on outbox processing when started SUPER_ADMIN 9001 exists
+    const envNoGroup: Env = {
+      ...env,
+      TELEGRAM_ADMIN_GROUP_ID: '',
+      TELEGRAM_BOT_USERNAME: '',
+      SUPER_ADMIN_IDS: '',
+    };
+    const depDraft = await depositService.startDepositWizard(envNoGroup, '7901');
+    await depositService.handleAmountInput(envNoGroup, '7901', '30000');
+    await depositService.handleMethodSelection(envNoGroup, '7901', 'KBZPAY');
+    await depositService.handleReferenceInput(envNoGroup, '7901', 'REF-NOGROUP-01');
+    const { deposit } = await depositService.confirmSubmission(envNoGroup, {
+      customerId: '7901',
+      draftToken: depDraft.draftToken,
+      correlationId: 'cor_nogroup_dep',
+    });
+    expect(deposit.status).toBe('SUBMITTED');
+
+    const groupOutboxRow = await db
+      .prepare(
+        `SELECT outbox_id, target_chat_id FROM outbox WHERE aggregate_id = ?1 AND event_type = 'GROUP_ALERT'`
+      )
+      .bind(deposit.deposit_id)
+      .first<{ outbox_id: string; target_chat_id: string }>();
+    expect(groupOutboxRow).not.toBeNull();
+    expect(groupOutboxRow!.target_chat_id).toBe('UNCONFIGURED_ADMIN_GROUP_CHAT');
+
+    const outboxOutcome = await outboxConsumer.processSingleOutbox(
+      envNoGroup,
+      groupOutboxRow!.outbox_id
+    );
+    expect(outboxOutcome.outcome).toBe('PERMANENT_FAILURE');
+    expect(externalFetchCalled).toBe(false);
+
+    const emergencyFallback = await db
+      .prepare(
+        `SELECT target_chat_id, payload_json, related_ticket_id FROM outbox WHERE aggregate_id = ?1 AND event_type = 'EMERGENCY_SUPER_ADMIN_FALLBACK'`
+      )
+      .bind(groupOutboxRow!.outbox_id)
+      .first<{ target_chat_id: string; payload_json: string; related_ticket_id: string }>();
+    expect(emergencyFallback).not.toBeNull();
+    expect(emergencyFallback!.target_chat_id).toBe('9001');
+    expect(emergencyFallback!.related_ticket_id).toBe(deposit.ticket_id);
+    expect(emergencyFallback!.payload_json).toContain('TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED');
+    expect(emergencyFallback!.payload_json).toContain(deposit.deposit_id);
+  });
+
+  // 38. Phase 3.3 Cron Trigger Dispatch Verification & Queue Retry Exhaustion -> Permanent Failure Handling
+  it('38. Dispatches all 3 cron schedules (* * * * *, */5 * * * *, 0 20 * * *) via workerEntry.scheduled and escalates exhausted retryable failures to permanent failure + fallback', async () => {
+    const nowMs = Date.now();
+    const waitUntilPromises: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil(p: Promise<unknown>) {
+        waitUntilPromises.push(p);
+      },
+      passThroughOnException() {},
+      props: {},
+    };
+
+    // Verify all 3 cron expressions execute cleanly via workerEntry.scheduled
+    for (const cronExpr of ['* * * * *', '*/5 * * * *', '0 20 * * *']) {
+      await workerEntry.scheduled(
+        { cron: cronExpr, scheduledTime: nowMs, noRetry() {} },
+        env,
+        ctx
+      );
+    }
+    await Promise.all(waitUntilPromises);
+
+    // Test retry exhaustion: outbox row at attempt_count = 5 (with max_attempts = 6) receives HTTP 502 from Telegram
+    // When claimed, attempt_count becomes 6 === max_attempts -> must transition to PERMANENT_FAILURE, record OUTBOX_PERMANENT_FAILURE, and trigger EMERGENCY_SUPER_ADMIN_FALLBACK
+    await db
+      .prepare(
+        `INSERT INTO outbox (
+           outbox_id, idempotency_key, event_type, aggregate_type, aggregate_id,
+           target_chat_id, ordering_key, sequence_no, telegram_method, payload_json,
+           is_idempotent_method, status, attempt_count, max_attempts, available_at, next_dispatch_at, created_at, updated_at
+         ) VALUES (
+           'obx_exhaust_502', 'k_exhaust_502', 'GROUP_ALERT', 'DEPOSIT', 'DEP-EXHAUST-01',
+           ?1, 'grp_exhaust', 1, 'sendMessage', ?2,
+           0, 'RETRYABLE_FAILURE', 5, 6, ?3, ?3, ?3, ?3
+         )`
+      )
+      .bind(
+        env.TELEGRAM_ADMIN_GROUP_ID,
+        JSON.stringify({ chat_id: env.TELEGRAM_ADMIN_GROUP_ID, text: '<b>Exhausted Group Alert</b>' }),
+        nowMs
+      )
+      .run();
+
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: false, error_code: 502, description: 'Bad Gateway' }), { status: 502 })
+    ) as typeof globalThis.fetch;
+
+    const exhaustRes = await outboxConsumer.processSingleOutbox(env, 'obx_exhaust_502', 'cor_exhaust', 'qev_exhaust_6', nowMs);
+    expect(exhaustRes.outcome).toBe('PERMANENT_FAILURE');
+
+    const exhaustedRow = await outboxRepository.getById(db, 'obx_exhaust_502');
+    expect(exhaustedRow!.status).toBe('PERMANENT_FAILURE');
+    expect(exhaustedRow!.last_error).toContain('MAX_ATTEMPTS_EXHAUSTED');
+
+    const exhaustAudit = await db
+      .prepare(`SELECT action FROM audit_logs WHERE resource_id = 'obx_exhaust_502' AND action = 'OUTBOX_PERMANENT_FAILURE'`)
+      .first<{ action: string }>();
+    expect(exhaustAudit).not.toBeNull();
+
+    const exhaustFallback = await db
+      .prepare(`SELECT target_chat_id, payload_json FROM outbox WHERE aggregate_id = 'obx_exhaust_502' AND event_type = 'EMERGENCY_SUPER_ADMIN_FALLBACK'`)
+      .first<{ target_chat_id: string; payload_json: string }>();
+    expect(exhaustFallback).not.toBeNull();
+    expect(exhaustFallback!.target_chat_id).toBe('9001');
+    expect(exhaustFallback!.payload_json).toContain('MAX_ATTEMPTS_EXHAUSTED');
+  });
+
+  // 39. Phase 3.3 Method-Specific Telegram API Payload Validation
+  it('39. Validates method-specific Telegram payload requirements across sendMessage, sendPhoto, sendDocument, editMessageText, answerCallbackQuery, getMe, and getChatMember', async () => {
+    let fetchCount = 0;
+    globalThis.fetch = vi.fn(async () => {
+      fetchCount++;
+      return new Response(JSON.stringify({ ok: true, result: { message_id: 101 } }), { status: 200 });
+    }) as typeof globalThis.fetch;
+
+    // 1. answerCallbackQuery succeeds WITHOUT chat_id, fails without callback_query_id
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'answerCallbackQuery', {
+        callback_query_id: 'cb_valid_123',
+        text: 'Claimed!',
+      })
+    ).resolves.toEqual({ messageId: 101, rawResult: { message_id: 101 } });
+    expect(fetchCount).toBe(1);
+
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'answerCallbackQuery', {
+        text: 'Missing callback_query_id',
+      })
+    ).rejects.toThrow(/TELEGRAM_CALLBACK_QUERY_ID_REQUIRED/);
+    expect(fetchCount).toBe(1);
+
+    // 2. getMe succeeds WITHOUT chat_id
+    await expect(telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'getMe', {})).resolves.toEqual({
+      messageId: 101,
+      rawResult: { message_id: 101 },
+    });
+    expect(fetchCount).toBe(2);
+
+    // 3. sendMessage requires chat_id and non-empty text
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'sendMessage', {
+        chat_id: '9001',
+        text: '   ',
+      })
+    ).rejects.toThrow(/TELEGRAM_MESSAGE_TEXT_REQUIRED/);
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'sendMessage', {
+        chat_id: '<TELEGRAM_ADMIN_GROUP_ID>',
+        text: 'Hello',
+      })
+    ).rejects.toThrow(/TELEGRAM_TARGET_CHAT_ID_NOT_CONFIGURED/);
+
+    // 4. sendPhoto requires chat_id and photo
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'sendPhoto', {
+        chat_id: '9001',
+      })
+    ).rejects.toThrow(/TELEGRAM_PHOTO_REQUIRED/);
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'sendPhoto', {
+        chat_id: '9001',
+        photo: 'AgACAgUAAxkBAAI',
+      })
+    ).resolves.toBeDefined();
+
+    // 5. sendDocument requires chat_id and document
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'sendDocument', {
+        chat_id: '9001',
+      })
+    ).rejects.toThrow(/TELEGRAM_DOCUMENT_REQUIRED/);
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'sendDocument', {
+        chat_id: '9001',
+        document: 'BQACAgUAAxkBAAI',
+      })
+    ).resolves.toBeDefined();
+
+    // 6. editMessageText supports inline_message_id WITHOUT chat_id, or chat_id + message_id
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'editMessageText', {
+        inline_message_id: 'inline_msg_99',
+        text: 'Updated inline text',
+      })
+    ).resolves.toBeDefined();
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'editMessageText', {
+        chat_id: '9001',
+        text: 'Missing message_id',
+      })
+    ).rejects.toThrow(/TELEGRAM_MESSAGE_ID_REQUIRED/);
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'editMessageText', {
+        chat_id: '9001',
+        message_id: 42,
+        text: 'Updated chat message',
+      })
+    ).resolves.toBeDefined();
+
+    // 7. getChatMember requires chat_id and user_id
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'getChatMember', {
+        chat_id: '-100999888777',
+      })
+    ).rejects.toThrow(/TELEGRAM_USER_ID_REQUIRED/);
+    await expect(
+      telegramService.callApi(env.TELEGRAM_BOT_TOKEN, 'getChatMember', {
+        chat_id: '-100999888777',
+        user_id: 9001,
+      })
+    ).resolves.toBeDefined();
+  });
+
+  // 40. Phase 3.3 Admin Notification Hold, Automatic Recovery (on Super Admin /start or Group Config), & Zero PII Leakage Matrix
+  it('40. Holds unreachable admin alerts when no SUPER_ADMIN has started the bot, recovers automatically on /start or group ID config, reopens if all fallback DMs fail, and never leaks PII', async () => {
+    const app = createApp();
+    // Mark all admins as unstarted (has_started_bot = 0) and leave TELEGRAM_ADMIN_GROUP_ID placeholder/unconfigured
+    await db.prepare(`UPDATE admins SET has_started_bot = 0`).run();
+
+    const envUnconfigured: Env = {
+      ...env,
+      TELEGRAM_ADMIN_GROUP_ID: '<TELEGRAM_ADMIN_GROUP_ID>',
+      SUPER_ADMIN_IDS: '9001',
+    };
+
+    await customerService.ensureActiveCustomer(envUnconfigured, {
+      customerId: '8101',
+      username: 'u8101',
+      firstName: 'HoldRecoverUser',
+    });
+
+    // Submit withdrawal with sensitive destination PII ("U Secret Holder - 09987654321")
+    const wdDraft = await withdrawalService.startWithdrawalWizard(envUnconfigured, '8101');
+    await withdrawalService.handleAmountInput(envUnconfigured, '8101', '50000');
+    await withdrawalService.handleMethodSelection(envUnconfigured, '8101', 'KBZPAY');
+    await withdrawalService.handleDestinationInput(envUnconfigured, '8101', 'U Secret Holder - 09987654321');
+    const { withdrawal } = await withdrawalService.confirmSubmission(envUnconfigured, {
+      customerId: '8101',
+      draftToken: wdDraft.draftToken,
+      correlationId: 'cor_hold_wd',
+    });
+
+    const groupOutbox = await db
+      .prepare(`SELECT * FROM outbox WHERE aggregate_id = ?1 AND event_type = 'GROUP_ALERT'`)
+      .bind(withdrawal.withdrawal_id)
+      .first<{ outbox_id: string; target_chat_id: string; payload_json: string; status: string }>();
+    expect(groupOutbox).not.toBeNull();
+    expect(groupOutbox!.target_chat_id).toBe('UNCONFIGURED_ADMIN_GROUP_CHAT');
+    // Group outbox payload must NEVER contain raw payout destination PII
+    expect(groupOutbox!.payload_json).not.toContain('09987654321');
+    expect(groupOutbox!.payload_json).not.toContain('U Secret Holder');
+
+    // 1. Processing outbox when TELEGRAM_ADMIN_GROUP_ID is unconfigured AND zero started SUPER_ADMINs exist:
+    //    MUST NOT mark SENT or abandon in PERMANENT_FAILURE -> holds in RETRYABLE_FAILURE and records ADMIN_NOTIFICATION_HELD_NO_REACHABLE_ADMIN
+    const holdRes = await outboxConsumer.processSingleOutbox(envUnconfigured, groupOutbox!.outbox_id);
+    expect(holdRes.outcome).toBe('RETRYABLE_FAILURE');
+
+    const heldRow = await outboxRepository.getById(db, groupOutbox!.outbox_id);
+    expect(heldRow!.status).toBe('RETRYABLE_FAILURE');
+    expect(heldRow!.last_error).toContain('ADMIN_NOTIFICATION_CHANNEL_UNAVAILABLE');
+
+    const holdAudit = await db
+      .prepare(`SELECT action FROM audit_logs WHERE resource_id = ?1 AND action = 'ADMIN_NOTIFICATION_HELD_NO_REACHABLE_ADMIN'`)
+      .bind(groupOutbox!.outbox_id)
+      .first<{ action: string }>();
+    expect(holdAudit).not.toBeNull();
+
+    // 2. Super Admin 9001 sends /start in private chat -> marks has_started_bot=1 and automatically releases held admin notification!
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: 555 } }), { status: 200 })
+    ) as typeof globalThis.fetch;
+
+    const startRes = await app.fetch(
+      new Request('https://bot.example/webhook', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Telegram-Bot-Api-Secret-Token': env.TELEGRAM_WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({
+          update_id: 99981,
+          message: {
+            message_id: 981,
+            date: 1700000000,
+            chat: { id: 9001, type: 'private' },
+            from: { id: 9001, is_bot: false, first_name: 'Super' },
+            text: '/start',
+          },
+        }),
+      }),
+      envUnconfigured
+    );
+    expect(startRes.status).toBe(200);
+
+    // Now process the released group alert -> creates EMERGENCY_SUPER_ADMIN_FALLBACK DM to started Super Admin 9001
+    const afterStartRes = await outboxConsumer.processSingleOutbox(envUnconfigured, groupOutbox!.outbox_id);
+    expect(afterStartRes.outcome).toBe('PERMANENT_FAILURE');
+
+    const fallbackRow = await db
+      .prepare(`SELECT * FROM outbox WHERE aggregate_id = ?1 AND event_type = 'EMERGENCY_SUPER_ADMIN_FALLBACK'`)
+      .bind(groupOutbox!.outbox_id)
+      .first<{ outbox_id: string; target_chat_id: string; payload_json: string }>();
+    expect(fallbackRow).not.toBeNull();
+    expect(fallbackRow!.target_chat_id).toBe('9001');
+    // Fallback DM must NEVER contain raw payout destination PII
+    expect(fallbackRow!.payload_json).not.toContain('09987654321');
+    expect(fallbackRow!.payload_json).not.toContain('U Secret Holder');
+
+    // 3. If ALL Super Admin fallback DMs fail permanently (e.g., Super Admin blocked the bot -> 403 Forbidden),
+    //    the original group alert row is reopened to RETRYABLE_FAILURE so it is never lost!
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: false, error_code: 403, description: 'Forbidden: bot was blocked by the user' }), { status: 403 })
+    ) as typeof globalThis.fetch;
+
+    const fbFailRes = await outboxConsumer.processSingleOutbox(envUnconfigured, fallbackRow!.outbox_id);
+    expect(fbFailRes.outcome).toBe('PERMANENT_FAILURE');
+
+    const reopenedGroupRow = await outboxRepository.getById(db, groupOutbox!.outbox_id);
+    expect(reopenedGroupRow!.status).toBe('RETRYABLE_FAILURE');
+    expect(reopenedGroupRow!.last_error).toContain('ALL_SUPER_ADMIN_FALLBACK_DMS_FAILED');
+
+    // 4. When TELEGRAM_ADMIN_GROUP_ID is subsequently configured in Dashboard, lease recovery cron heals UNCONFIGURED_ADMIN_GROUP_CHAT -> real group chat ID and delivers!
+    globalThis.fetch = vi.fn(async () =>
+      new Response(JSON.stringify({ ok: true, result: { message_id: 888 } }), { status: 200 })
+    ) as typeof globalThis.fetch;
+
+    await scheduledDispatcher.runLeaseRecoveryCron(env, Date.now());
+    const healedRow = await outboxRepository.getById(db, groupOutbox!.outbox_id);
+    expect(healedRow!.target_chat_id).toBe(env.TELEGRAM_ADMIN_GROUP_ID);
+
+    const deliveredRes = await outboxConsumer.processSingleOutbox(env, groupOutbox!.outbox_id);
+    expect(deliveredRes.outcome).toBe('SENT');
+  });
 });
+
+
+
 

@@ -108,6 +108,15 @@ export async function constantTimeSecretMatch(
   if (!providedSecret || !expectedSecret) {
     return false;
   }
+  const trimmedProvided = providedSecret.trim();
+  const trimmedExpected = expectedSecret.trim();
+  if (
+    !trimmedProvided ||
+    !trimmedExpected ||
+    PLACEHOLDER_KEY_PATTERNS.some((re) => re.test(trimmedExpected))
+  ) {
+    return false;
+  }
   // Hash both values with SHA-256 so fixed 32-byte digests are compared in constant time
   // without leaking the secret's length and without requiring node:crypto.
   const [digestA, digestB] = await Promise.all([
