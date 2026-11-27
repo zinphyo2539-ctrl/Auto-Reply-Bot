@@ -27,7 +27,14 @@ import { chunkTelegramText, escapeHtml } from '../src/worker/lib/textChunker';
 import { redactLogObject } from '../src/worker/lib/logger';
 import { containsForbiddenFinancialCommitment } from '../src/worker/schemas/geminiSchemas';
 import {
+  CONFIRMED_STAGING_D1_DATABASE_ID,
+  CONFIRMED_STAGING_D1_DATABASE_NAME,
+  CONFIRMED_STAGING_DLQ,
+  CONFIRMED_STAGING_PRIMARY_QUEUE,
   DASHBOARD_MANAGED_VAR_KEYS,
+  EXPECTED_PRODUCTION_WORKER_NAME,
+  EXPECTED_ROOT_WORKER_NAME,
+  EXPECTED_STAGING_WORKER_NAME,
   OPTIONAL_ROTATION_SECRET_KEYS,
   REQUIRED_SECRET_KEYS,
   REQUIRED_STATIC_VAR_KEYS,
@@ -35,6 +42,7 @@ import {
   validateWranglerDeploymentConfig,
   type WranglerRootConfig,
 } from '../src/worker/lib/deploymentGuard';
+import { runPredeployCheck } from '../scripts/predeploy-check';
 
 const MIGRATIONS_DIR = path.resolve(process.cwd(), 'migrations');
 
@@ -1580,29 +1588,36 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(ret.expiredAuditLogsDeleted).toBe(1);
   });
 
-  // 25. Cloudflare wrangler.jsonc (Architecture B + Dashboard-Managed Variables) & .env.example Configuration Parity
-  it('25. Verifies Architecture B top-level staging config, keep_vars: true, Dashboard-managed vars omission, cron triggers, and .env.example parity', () => {
+  // 25. Cloudflare wrangler.jsonc (Phase 6.3 Zero-Root-Binding + Isolated Staging + Dashboard-Managed Variables) & .env.example Configuration Parity
+  it('25. Verifies Phase 6.3 zero-root-binding isolation, env.staging exclusive staging config, keep_vars: true, Dashboard-managed vars omission, cron triggers, and .env.example parity', () => {
     const wranglerRaw = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.jsonc'), 'utf8');
     const wranglerCfg = JSON.parse(wranglerRaw) as WranglerRootConfig;
 
-    // 1. Top-level Architecture B temporary staging identity & keep_vars: true
-    expect(wranglerCfg.name).toBe('auto-reply-bot');
+    // 1. Top-level Worker identity preserved as auto-reply-bot & keep_vars: true at root only
+    expect(wranglerCfg.name).toBe(EXPECTED_ROOT_WORKER_NAME);
     expect(wranglerCfg.keep_vars).toBe(true);
 
-    // 2. keep_vars must NOT be placed inside named environments
+    // 2. Root scope contains ZERO D1 bindings, Queue bindings, runtime vars, or Cron triggers
+    expect(wranglerCfg.vars).toBeUndefined();
+    expect(wranglerCfg.d1_databases).toBeUndefined();
+    expect(wranglerCfg.queues).toBeUndefined();
+    expect(wranglerCfg.triggers).toBeUndefined();
+    expect(wranglerCfg.build?.command).toContain('scripts/predeploy-check.ts --target=top-level');
+
+    // 3. keep_vars must NOT be placed inside named environments
     expect(wranglerCfg.env?.staging).toBeDefined();
     expect(wranglerCfg.env?.production).toBeDefined();
     expect(wranglerCfg.env?.staging).not.toHaveProperty('keep_vars');
     expect(wranglerCfg.env?.production).not.toHaveProperty('keep_vars');
+    expect(wranglerCfg.env?.staging?.build?.command).toContain('scripts/predeploy-check.ts --target=staging');
+    expect(wranglerCfg.env?.production?.build?.command).toContain('scripts/predeploy-check.ts --target=production');
 
-    // 3. Top-level environment is explicitly staging for Architecture B
-    expect(wranglerCfg.vars?.ENVIRONMENT).toBe('staging');
+    // 4. Environment separation: env.staging is "staging", env.production is "production"
     expect(wranglerCfg.env?.staging?.vars?.ENVIRONMENT).toBe('staging');
     expect(wranglerCfg.env?.production?.vars?.ENVIRONMENT).toBe('production');
 
-    // 4. The three Dashboard-managed variables are omitted from every Wrangler vars block
+    // 5. The three Dashboard-managed variables and all secrets are omitted from every Wrangler vars block
     const allVarsBlocks = [
-      wranglerCfg.vars ?? {},
       wranglerCfg.env?.staging?.vars ?? {},
       wranglerCfg.env?.production?.vars ?? {},
     ];
@@ -1613,11 +1628,9 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       for (const secretKey of [...REQUIRED_SECRET_KEYS, ...OPTIONAL_ROTATION_SECRET_KEYS]) {
         expect(varsBlock).not.toHaveProperty(secretKey);
       }
-      // No CONFIGURED_IN_CLOUDFLARE_ENV or PENDING_OWNER_* placeholder value deployed as a variable
       for (const val of Object.values(varsBlock)) {
         expect(String(val)).not.toMatch(/CONFIGURED_IN_CLOUDFLARE_ENV|PENDING_OWNER_CONFIRMATION|PENDING_OWNER_CONFIGURATION/i);
       }
-      // All 10 static configuration variables exist
       for (const staticKey of REQUIRED_STATIC_VAR_KEYS) {
         expect(typeof varsBlock[staticKey]).toBe('string');
         expect(String(varsBlock[staticKey]).trim().length).toBeGreaterThan(0);
@@ -1625,13 +1638,10 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     }
 
     const expectedCrons = ['* * * * *', '*/5 * * * *', '0 20 * * *'];
-    expect(wranglerCfg.triggers?.crons).toEqual(expectedCrons);
     expect(wranglerCfg.env?.staging?.triggers?.crons).toEqual(expectedCrons);
     expect(wranglerCfg.env?.production?.triggers?.crons).toEqual(expectedCrons);
 
     // Ensure removed unused SLA env vars are gone
-    expect(wranglerCfg.vars).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
-    expect(wranglerCfg.vars).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
     expect(wranglerCfg.env?.staging?.vars).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
     expect(wranglerCfg.env?.staging?.vars).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
 
@@ -1649,11 +1659,11 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
 
     expect(envMap).not.toHaveProperty('SUPPORT_REMINDER_MINUTES');
     expect(envMap).not.toHaveProperty('SUPPORT_ESCALATION_MINUTES');
-    expect(envMap.RETENTION_MESSAGES_DAYS).toBe(wranglerCfg.vars?.RETENTION_MESSAGES_DAYS);
-    expect(envMap.RETENTION_FINGERPRINTS_DAYS).toBe(wranglerCfg.vars?.RETENTION_FINGERPRINTS_DAYS);
-    expect(envMap.RETENTION_AUDIT_DAYS).toBe(wranglerCfg.vars?.RETENTION_AUDIT_DAYS);
-    expect(envMap.RETENTION_WITHDRAWAL_PII_DAYS).toBe(wranglerCfg.vars?.RETENTION_WITHDRAWAL_PII_DAYS);
-    expect(envMap.RETENTION_OUTBOX_DAYS).toBe(wranglerCfg.vars?.RETENTION_OUTBOX_DAYS);
+    expect(envMap.RETENTION_MESSAGES_DAYS).toBe(wranglerCfg.env?.staging?.vars?.RETENTION_MESSAGES_DAYS);
+    expect(envMap.RETENTION_FINGERPRINTS_DAYS).toBe(wranglerCfg.env?.staging?.vars?.RETENTION_FINGERPRINTS_DAYS);
+    expect(envMap.RETENTION_AUDIT_DAYS).toBe(wranglerCfg.env?.staging?.vars?.RETENTION_AUDIT_DAYS);
+    expect(envMap.RETENTION_WITHDRAWAL_PII_DAYS).toBe(wranglerCfg.env?.staging?.vars?.RETENTION_WITHDRAWAL_PII_DAYS);
+    expect(envMap.RETENTION_OUTBOX_DAYS).toBe(wranglerCfg.env?.staging?.vars?.RETENTION_OUTBOX_DAYS);
 
     // Ensure .env.example documents Dashboard-managed variables with placeholders and all 6 required/optional Secret names with empty values
     expect(envMap.TELEGRAM_BOT_USERNAME).toBe('<TELEGRAM_BOT_USERNAME>');
@@ -1668,22 +1678,17 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       expect(envMap[optSecret]).toBe('');
     }
 
-    // Verify top-level, staging, and production D1 & Queue bindings (including DLQ max_retries: 0)
-    expect(wranglerCfg.d1_databases?.[0]?.binding).toBe('DB');
-    expect(wranglerCfg.d1_databases?.[0]?.database_name).toBe('vip-gaming-d1-staging');
-    expect(wranglerCfg.d1_databases?.[0]?.database_id).toBe('bf4ea8f0-9212-4028-bc3b-00f274d44413');
+    // Verify isolated staging and production D1 & Queue bindings (including DLQ max_retries: 0)
     expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.binding).toBe('DB');
-    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.database_name).toBe('vip-gaming-d1-staging');
-    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.database_id).toBe('bf4ea8f0-9212-4028-bc3b-00f274d44413');
+    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.database_name).toBe(CONFIRMED_STAGING_D1_DATABASE_NAME);
+    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.database_id).toBe(CONFIRMED_STAGING_D1_DATABASE_ID);
     expect(wranglerCfg.env?.production?.d1_databases?.[0]?.binding).toBe('DB');
     expect(wranglerCfg.env?.production?.d1_databases?.[0]?.database_name).toBe('vip-gaming-d1-prod');
     expect(wranglerCfg.env?.production?.d1_databases?.[0]?.database_id).toBe('00000000-0000-0000-0000-000000000000');
-    expect(wranglerCfg.queues?.producers?.[0]?.binding).toBe('OUTBOX_QUEUE');
-    const topDlq = wranglerCfg.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-staging');
-    const stagingDlq = wranglerCfg.env?.staging?.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-staging');
+    expect(wranglerCfg.env?.staging?.queues?.producers?.[0]?.binding).toBe('OUTBOX_QUEUE');
+    expect(wranglerCfg.env?.staging?.queues?.producers?.[0]?.queue).toBe(CONFIRMED_STAGING_PRIMARY_QUEUE);
+    const stagingDlq = wranglerCfg.env?.staging?.queues?.consumers?.find((c) => c.queue === CONFIRMED_STAGING_DLQ);
     const prodDlq = wranglerCfg.env?.production?.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-prod');
-    expect(topDlq).toBeDefined();
-    expect(topDlq!.max_retries).toBe(0);
     expect(stagingDlq).toBeDefined();
     expect(stagingDlq!.max_retries).toBe(0);
     expect(prodDlq).toBeDefined();
@@ -2641,18 +2646,18 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(migAlert!.payload_json).toContain('-1001122334455');
   });
 
-  // 36. Phase 3.3 5-State Deployment Readiness Gate, Live Worker Replacement Protection, & Cross-Environment Isolation
-  it('36. Enforces 5-state fail-closed deployment readiness gate (localConfigValid, stagingResourceReady, secretConfigReady, adminNotificationReady, deploymentAuthorized) and blocks unacknowledged live Worker replacement', () => {
+  // 36. Phase 6.3 5-State Deployment Readiness Gate, Zero-Root-Binding Isolation, & Explicit targetEnv Enforcement
+  it('36. Enforces 5-state fail-closed deployment readiness gate (localConfigValid, stagingResourceReady, secretConfigReady, adminNotificationReady, deploymentAuthorized) and Phase 6.3 staging isolation', () => {
     const wranglerRaw = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.jsonc'), 'utf8');
     const envExampleRaw = fs.readFileSync(path.resolve(process.cwd(), '.env.example'), 'utf8');
     const currentRepoCfg = JSON.parse(wranglerRaw) as WranglerRootConfig;
 
-    // 1. Current repository config without external verification:
-    //    localConfigValid=true, but stagingResourceReady=false, secretConfigReady=false, adminNotificationReady=false, deploymentAuthorized=false
+    // 1. Current repository config targeting env.staging without external verification:
+    //    localConfigValid=true, liveWorkerReplacementRisk=false, resolvedWorkerName='auto-reply-bot-staging'
     const repoCheck = validateWranglerDeploymentConfig(currentRepoCfg, {
-      targetEnv: 'top-level',
+      targetEnv: 'staging',
       phaseMode: 'temporary_staging',
-      ciOverrideName: 'auto-reply-bot',
+      ciOverrideName: EXPECTED_STAGING_WORKER_NAME,
       envExampleContent: envExampleRaw,
     });
     expect(repoCheck.localConfigValid).toBe(true);
@@ -2661,13 +2666,12 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(repoCheck.adminNotificationReady).toBe(false);
     expect(repoCheck.deploymentAuthorized).toBe(false);
     expect(repoCheck.readyToDeploy).toBe(false);
-    expect(repoCheck.liveWorkerReplacementRisk).toBe(true);
+    expect(repoCheck.liveWorkerReplacementRisk).toBe(false);
     expect(repoCheck.advisoryScope).toBe('LOCAL_REPOSITORY_CHECK_ONLY_NOT_REMOTE_CI_OR_IAM_LOCK');
-    expect(repoCheck.resolvedWorkerName).toBe('auto-reply-bot');
+    expect(repoCheck.resolvedWorkerName).toBe(EXPECTED_STAGING_WORKER_NAME);
     expect(repoCheck.issues.map((i) => i.code)).not.toContain('PLACEHOLDER_D1_DATABASE_ID');
     expect(repoCheck.issues.map((i) => i.code)).toEqual(
       expect.arrayContaining([
-        'LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED',
         'UNVERIFIED_EXTERNAL_STAGING_RESOURCES',
         'UNVERIFIED_EXTERNAL_SECRETS',
         'UNVERIFIED_ADMIN_NOTIFICATION_ROUTE',
@@ -2676,25 +2680,21 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
 
     // 1b. Placeholder D1 UUID is rejected with PLACEHOLDER_D1_DATABASE_ID
     const placeholderD1Cfg: WranglerRootConfig = structuredClone(currentRepoCfg);
-    placeholderD1Cfg.d1_databases![0].database_id = '00000000-0000-0000-0000-000000000000';
     placeholderD1Cfg.env!.staging.d1_databases![0].database_id = '00000000-0000-0000-0000-000000000000';
     const placeholderD1Res = validateWranglerDeploymentConfig(placeholderD1Cfg, {
-      targetEnv: 'top-level',
+      targetEnv: 'staging',
       phaseMode: 'temporary_staging',
-      ciOverrideName: 'auto-reply-bot',
       envExampleContent: envExampleRaw,
     });
     expect(placeholderD1Res.stagingResourceReady).toBe(false);
     expect(placeholderD1Res.issues.map((i) => i.code)).toContain('PLACEHOLDER_D1_DATABASE_ID');
 
     // 2. Empty externalVerification: {} must NOT produce false positives
-    const validUuid = 'bf4ea8f0-9212-4028-bc3b-00f274d44413';
     const readyCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
 
     const emptyExternalRes = validateWranglerDeploymentConfig(readyCfg, {
-      targetEnv: 'top-level',
+      targetEnv: 'staging',
       phaseMode: 'temporary_staging',
-      ciOverrideName: 'auto-reply-bot',
       envExampleContent: envExampleRaw,
       externalVerification: {},
     });
@@ -2707,18 +2707,23 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     // 3. Root vs env.staging Worker identity collision (if env.staging.name === "auto-reply-bot") is rejected
     const identityCollisionCfg: WranglerRootConfig = structuredClone(readyCfg);
     identityCollisionCfg.env!.staging.name = 'auto-reply-bot';
-    const identityCollisionRes = validateWranglerDeploymentConfig(identityCollisionCfg);
+    const identityCollisionRes = validateWranglerDeploymentConfig(identityCollisionCfg, {
+      targetEnv: 'staging',
+    });
     expect(identityCollisionRes.localConfigValid).toBe(false);
     expect(identityCollisionRes.issues.map((i) => i.code)).toContain('ROOT_STAGING_WORKER_IDENTITY_COLLISION');
 
-    // 4. Divergent top-level vs env.staging D1 database_id triggers STAGING_TOP_LEVEL_ENV_MISMATCH
-    const divergentStagingCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
-    divergentStagingCfg.d1_databases![0].database_id = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
-    const divergentRes = validateWranglerDeploymentConfig(divergentStagingCfg);
-    expect(divergentRes.stagingResourceReady).toBe(false);
-    expect(divergentRes.issues.map((i) => i.code)).toContain('STAGING_TOP_LEVEL_ENV_MISMATCH');
+    // 4. Non-confirmed staging D1 UUID triggers STAGING_RESOURCE_IDENTITY_MISMATCH
+    const wrongStagingUuidCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
+    wrongStagingUuidCfg.env!.staging.d1_databases![0].database_id = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+    const wrongStagingUuidRes = validateWranglerDeploymentConfig(wrongStagingUuidCfg, {
+      targetEnv: 'staging',
+    });
+    expect(wrongStagingUuidRes.localConfigValid).toBe(false);
+    expect(wrongStagingUuidRes.stagingResourceReady).toBe(false);
+    expect(wrongStagingUuidRes.issues.map((i) => i.code)).toContain('STAGING_RESOURCE_IDENTITY_MISMATCH');
 
-    // 5. All external verification checks verified, but liveWorkerReplacementRisk not acknowledged -> still blocked!
+    // 5. Full external verification on env.staging makes readyToDeploy=true while deploymentAuthorized remains false until explicitOwnerAuthorization=true
     const fullExternalVerification = {
       stagingResources: {
         d1DatabaseProvisioned: true,
@@ -2738,34 +2743,18 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
         configuredSuperAdminIds: '9001',
       },
     };
-    const unackReplacementRes = validateWranglerDeploymentConfig(readyCfg, {
-      targetEnv: 'top-level',
-      phaseMode: 'temporary_staging',
-      ciOverrideName: 'auto-reply-bot',
-      envExampleContent: envExampleRaw,
-      externalVerification: fullExternalVerification,
-      acknowledgeLiveWorkerReplacementRisk: false,
-    });
-    expect(unackReplacementRes.localConfigValid).toBe(true);
-    expect(unackReplacementRes.stagingResourceReady).toBe(true);
-    expect(unackReplacementRes.secretConfigReady).toBe(true);
-    expect(unackReplacementRes.adminNotificationReady).toBe(true);
-    expect(unackReplacementRes.readyToDeploy).toBe(false);
-    expect(unackReplacementRes.issues.map((i) => i.code)).toEqual(['LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED']);
-
-    // 6. Full external verification + acknowledgeLiveWorkerReplacementRisk: true makes readyToDeploy=true while deploymentAuthorized remains false until explicitOwnerAuthorization=true
     const readyRes = validateWranglerDeploymentConfig(readyCfg, {
-      targetEnv: 'top-level',
+      targetEnv: 'staging',
       phaseMode: 'temporary_staging',
-      ciOverrideName: 'auto-reply-bot',
+      ciOverrideName: EXPECTED_STAGING_WORKER_NAME,
       envExampleContent: envExampleRaw,
       externalVerification: fullExternalVerification,
-      acknowledgeLiveWorkerReplacementRisk: true,
     });
     expect(readyRes.localConfigValid).toBe(true);
     expect(readyRes.stagingResourceReady).toBe(true);
     expect(readyRes.secretConfigReady).toBe(true);
     expect(readyRes.adminNotificationReady).toBe(true);
+    expect(readyRes.liveWorkerReplacementRisk).toBe(false);
     expect(readyRes.deploymentAuthorized).toBe(false);
     expect(readyRes.readyToDeploy).toBe(true);
     expect(readyRes.issues).toHaveLength(0);
@@ -2773,47 +2762,48 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     // enforceDeploymentGate blocks deployment when explicitOwnerAuthorization is omitted
     expect(() =>
       enforceDeploymentGate(readyCfg, {
-        targetEnv: 'top-level',
+        targetEnv: 'staging',
         phaseMode: 'temporary_staging',
-        ciOverrideName: 'auto-reply-bot',
+        ciOverrideName: EXPECTED_STAGING_WORKER_NAME,
         envExampleContent: envExampleRaw,
         externalVerification: fullExternalVerification,
-        acknowledgeLiveWorkerReplacementRisk: true,
       })
     ).toThrow(/DEPLOYMENT_NOT_AUTHORIZED/);
 
     const authorizedGateRes = enforceDeploymentGate(readyCfg, {
-      targetEnv: 'top-level',
+      targetEnv: 'staging',
       phaseMode: 'temporary_staging',
-      ciOverrideName: 'auto-reply-bot',
+      ciOverrideName: EXPECTED_STAGING_WORKER_NAME,
       envExampleContent: envExampleRaw,
       externalVerification: fullExternalVerification,
-      acknowledgeLiveWorkerReplacementRisk: true,
       explicitOwnerAuthorization: true,
     });
     expect(authorizedGateRes.deploymentAuthorized).toBe(true);
     expect(authorizedGateRes.readyToDeploy).toBe(true);
 
-    // 7. Rejects missing top-level keep_vars or keep_vars inside named environments
+    // 6. Rejects missing top-level keep_vars or keep_vars inside named environments
     const badKeepVarsCfg: WranglerRootConfig = structuredClone(readyCfg);
     badKeepVarsCfg.keep_vars = false;
     badKeepVarsCfg.env!.staging.keep_vars = true;
-    const keepVarsRes = validateWranglerDeploymentConfig(badKeepVarsCfg);
+    const keepVarsRes = validateWranglerDeploymentConfig(badKeepVarsCfg, {
+      targetEnv: 'staging',
+    });
     expect(keepVarsRes.localConfigValid).toBe(false);
     expect(keepVarsRes.readyToDeploy).toBe(false);
     expect(keepVarsRes.issues.map((i) => i.code)).toEqual(
       expect.arrayContaining(['MISSING_TOP_LEVEL_KEEP_VARS', 'INVALID_NAMED_ENV_KEEP_VARS'])
     );
 
-    // 8. Rejects Dashboard-managed variables, unknown vars, or secrets in Wrangler vars, and detects historical plaintext secret bindings on Dashboard
+    // 7. Rejects Dashboard-managed variables, unknown vars, or secrets in Wrangler vars, and detects historical plaintext secret bindings on Dashboard
     const badVarsCfg: WranglerRootConfig = structuredClone(readyCfg);
-    badVarsCfg.vars = {
-      ...badVarsCfg.vars,
+    badVarsCfg.env!.staging.vars = {
+      ...badVarsCfg.env!.staging.vars,
       TELEGRAM_BOT_USERNAME: 'CONFIGURED_IN_CLOUDFLARE_ENV',
       TELEGRAM_BOT_TOKEN: 'leaked_secret_in_vars',
       UNKNOWN_UNCONSUMED_VAR: 'unexpected_value',
     };
     const badVarsRes = validateWranglerDeploymentConfig(badVarsCfg, {
+      targetEnv: 'staging',
       dashboardPlaintextBindingKeys: ['GEMINI_API_KEY', 'TELEGRAM_WEBHOOK_SECRET'],
       externalVerification: fullExternalVerification,
     });
@@ -2830,26 +2820,30 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       ])
     );
 
-    // 9. Rejects Staging vs Production D1 or Queue resource collision
+    // 8. Rejects Staging vs Production D1 or Queue resource collision
     const collisionCfg: WranglerRootConfig = structuredClone(readyCfg);
-    collisionCfg.env!.production.d1_databases![0].database_id = validUuid;
-    collisionCfg.env!.production.queues!.producers![0].queue = 'vip-outbox-queue-staging';
-    const collisionRes = validateWranglerDeploymentConfig(collisionCfg);
+    collisionCfg.env!.production.d1_databases![0].database_id = CONFIRMED_STAGING_D1_DATABASE_ID;
+    collisionCfg.env!.production.queues!.producers![0].queue = CONFIRMED_STAGING_PRIMARY_QUEUE;
+    const collisionRes = validateWranglerDeploymentConfig(collisionCfg, {
+      targetEnv: 'staging',
+    });
     expect(collisionRes.stagingResourceReady).toBe(false);
     expect(collisionRes.issues.map((i) => i.code)).toContain('STAGING_PRODUCTION_RESOURCE_COLLISION');
 
-    // 10. Rejects missing D1 bindings and missing Queue producer / consumers / DLQ
+    // 9. Rejects missing D1 bindings and missing Queue producer / consumers / DLQ
     const missingBindingsCfg: WranglerRootConfig = structuredClone(readyCfg);
-    missingBindingsCfg.d1_databases = [];
-    missingBindingsCfg.queues = { producers: [], consumers: [] };
-    const missingBindingsRes = validateWranglerDeploymentConfig(missingBindingsCfg);
+    missingBindingsCfg.env!.staging.d1_databases = [];
+    missingBindingsCfg.env!.staging.queues = { producers: [], consumers: [] };
+    const missingBindingsRes = validateWranglerDeploymentConfig(missingBindingsCfg, {
+      targetEnv: 'staging',
+    });
     expect(missingBindingsRes.readyToDeploy).toBe(false);
     expect(missingBindingsRes.issues.map((i) => i.code)).toEqual(
       expect.arrayContaining(['MISSING_D1_BINDING', 'MISSING_QUEUE_PRODUCER'])
     );
 
     const missingDlqCfg: WranglerRootConfig = structuredClone(readyCfg);
-    missingDlqCfg.queues!.consumers = [
+    missingDlqCfg.env!.staging.queues!.consumers = [
       {
         queue: 'vip-outbox-queue-staging',
         max_batch_size: 10,
@@ -2857,33 +2851,34 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
         dead_letter_queue: 'vip-outbox-dlq-staging',
       },
     ];
-    const missingDlqRes = validateWranglerDeploymentConfig(missingDlqCfg);
+    const missingDlqRes = validateWranglerDeploymentConfig(missingDlqCfg, {
+      targetEnv: 'staging',
+    });
     expect(missingDlqRes.readyToDeploy).toBe(false);
     expect(missingDlqRes.issues.map((i) => i.code)).toContain('MISSING_DLQ_CONSUMER');
 
-    // 11. Rejects accidental production deployment or top-level ENVIRONMENT="production" or inconsistent Worker name during temporary staging phase
-    const accidentalProdTopCfg: WranglerRootConfig = structuredClone(readyCfg);
-    accidentalProdTopCfg.name = 'vip-gaming-bot';
-    accidentalProdTopCfg.vars!.ENVIRONMENT = 'production';
-    const accidentalProdTopRes = validateWranglerDeploymentConfig(accidentalProdTopCfg);
-    expect(accidentalProdTopRes.readyToDeploy).toBe(false);
-    expect(accidentalProdTopRes.issues.map((i) => i.code)).toEqual(
-      expect.arrayContaining([
-        'INCONSISTENT_WORKER_IDENTITY',
-        'TOP_LEVEL_NOT_STAGING_IN_ARCHITECTURE_B',
-      ])
-    );
+    // 10. Rejects accidental production deployment, root deployment, or inconsistent Worker name
+    const badNameCfg: WranglerRootConfig = structuredClone(readyCfg);
+    badNameCfg.name = 'vip-gaming-bot';
+    const badNameRes = validateWranglerDeploymentConfig(badNameCfg, {
+      targetEnv: 'staging',
+    });
+    expect(badNameRes.readyToDeploy).toBe(false);
+    expect(badNameRes.issues.map((i) => i.code)).toContain('INCONSISTENT_WORKER_IDENTITY');
 
     const accidentalProdEnvRes = validateWranglerDeploymentConfig(readyCfg, {
       targetEnv: 'production',
       phaseMode: 'temporary_staging',
     });
     expect(accidentalProdEnvRes.readyToDeploy).toBe(false);
-    expect(accidentalProdEnvRes.issues.map((i) => i.code)).toContain(
-      'PRODUCTION_BLOCKED_IN_TEMPORARY_STAGING_PHASE'
+    expect(accidentalProdEnvRes.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining([
+        'PRODUCTION_BLOCKED_IN_TEMPORARY_STAGING_PHASE',
+        'PLACEHOLDER_D1_DATABASE_ID',
+      ])
     );
 
-    // 12. Rejects invalid environment selection and incompatible WRANGLER_CI_OVERRIDE_NAME
+    // 11. Rejects invalid environment selection and incompatible WRANGLER_CI_OVERRIDE_NAME
     const invalidEnvRes = validateWranglerDeploymentConfig(readyCfg, {
       targetEnv: 'nonexistent_env',
     });
@@ -2895,14 +2890,8 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       ciOverrideName: 'auto-reply-bot',
     });
     expect(ciMismatchRes.readyToDeploy).toBe(false);
+    expect(ciMismatchRes.liveWorkerReplacementRisk).toBe(true);
     expect(ciMismatchRes.issues.map((i) => i.code)).toContain('CI_OVERRIDE_NAME_MISMATCH');
-
-    const ciTopMismatchRes = validateWranglerDeploymentConfig(readyCfg, {
-      targetEnv: 'top-level',
-      ciOverrideName: 'different-worker-service',
-    });
-    expect(ciTopMismatchRes.readyToDeploy).toBe(false);
-    expect(ciTopMismatchRes.issues.map((i) => i.code)).toContain('CI_OVERRIDE_NAME_MISMATCH');
   });
 
   // 37. Phase 3.2/3.3 Runtime Fail-Safe Verification for Missing/Placeholder Secrets and Dashboard Variables
@@ -3315,6 +3304,170 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
 
     const deliveredRes = await outboxConsumer.processSingleOutbox(env, groupOutbox!.outbox_id);
     expect(deliveredRes.outcome).toBe('SENT');
+  });
+
+  // 41. Phase 6.3 Comprehensive Pre-Deploy Guard, Zero-Root-Binding Isolation, & CLI Enforcement Verification
+  it('41. Enforces all 13 Phase 6.3 staging isolation invariants across deploymentGuard, scripts/predeploy-check.ts, wrangler.jsonc, and package.json', () => {
+    const wranglerRaw = fs.readFileSync(path.resolve(process.cwd(), 'wrangler.jsonc'), 'utf8');
+    const pkgRaw = fs.readFileSync(path.resolve(process.cwd(), 'package.json'), 'utf8');
+    const currentRepoCfg = JSON.parse(wranglerRaw) as WranglerRootConfig;
+    const pkgJson = JSON.parse(pkgRaw) as { scripts?: Record<string, string> };
+
+    // 1. Existing Worker identity preservation & Staging/Production Worker identities
+    expect(currentRepoCfg.name).toBe(EXPECTED_ROOT_WORKER_NAME);
+    expect(currentRepoCfg.keep_vars).toBe(true);
+    expect(currentRepoCfg.env?.staging?.name).toBeUndefined();
+    expect(currentRepoCfg.env?.production?.name).toBeUndefined();
+
+    const stagingRes = validateWranglerDeploymentConfig(currentRepoCfg, { targetEnv: 'staging' });
+    expect(stagingRes.resolvedWorkerName).toBe(EXPECTED_STAGING_WORKER_NAME);
+    expect(stagingRes.liveWorkerReplacementRisk).toBe(false);
+
+    const prodRes = validateWranglerDeploymentConfig(currentRepoCfg, { targetEnv: 'production' });
+    expect(prodRes.resolvedWorkerName).toBe(EXPECTED_PRODUCTION_WORKER_NAME);
+
+    // 2. Exact Staging D1 UUID & exclusive Staging Queue bindings
+    const stgD1 = currentRepoCfg.env?.staging?.d1_databases?.[0];
+    expect(stgD1).toEqual({
+      binding: 'DB',
+      database_name: CONFIRMED_STAGING_D1_DATABASE_NAME,
+      database_id: CONFIRMED_STAGING_D1_DATABASE_ID,
+      migrations_dir: 'migrations',
+    });
+    expect(currentRepoCfg.env?.staging?.queues?.producers).toEqual([
+      {
+        binding: 'OUTBOX_QUEUE',
+        queue: CONFIRMED_STAGING_PRIMARY_QUEUE,
+      },
+    ]);
+    expect(currentRepoCfg.env?.staging?.queues?.consumers?.map((c) => c.queue)).toEqual([
+      CONFIRMED_STAGING_PRIMARY_QUEUE,
+      CONFIRMED_STAGING_DLQ,
+    ]);
+
+    // 3. Root resource prohibition (root cannot declare D1, Queues, vars, or crons)
+    const rootWithBindingsCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
+    rootWithBindingsCfg.d1_databases = [
+      {
+        binding: 'DB',
+        database_name: CONFIRMED_STAGING_D1_DATABASE_NAME,
+        database_id: CONFIRMED_STAGING_D1_DATABASE_ID,
+        migrations_dir: 'migrations',
+      },
+    ];
+    rootWithBindingsCfg.queues = {
+      producers: [{ binding: 'OUTBOX_QUEUE', queue: CONFIRMED_STAGING_PRIMARY_QUEUE }],
+      consumers: [{ queue: CONFIRMED_STAGING_PRIMARY_QUEUE, dead_letter_queue: CONFIRMED_STAGING_DLQ }],
+    };
+    const rootBindingsRes = validateWranglerDeploymentConfig(rootWithBindingsCfg, {
+      targetEnv: 'staging',
+    });
+    expect(rootBindingsRes.localConfigValid).toBe(false);
+    expect(rootBindingsRes.stagingResourceReady).toBe(false);
+    expect(rootBindingsRes.issues.map((i) => i.code)).toEqual(
+      expect.arrayContaining([
+        'ROOT_RESOURCE_BINDINGS_FORBIDDEN',
+        'STAGING_PRODUCTION_RESOURCE_COLLISION',
+      ])
+    );
+
+    // 4. Staging/production D1 isolation & 5. Staging/production Queue isolation & 12. Production Queue consumer ownership
+    const prodD1 = currentRepoCfg.env?.production?.d1_databases?.[0];
+    expect(prodD1?.database_name).toBe('vip-gaming-d1-prod');
+    expect(prodD1?.database_id).toBe('00000000-0000-0000-0000-000000000000');
+    expect(prodD1?.database_name).not.toBe(stgD1?.database_name);
+    expect(prodD1?.database_id).not.toBe(stgD1?.database_id);
+
+    const prodConsumerQueues = currentRepoCfg.env?.production?.queues?.consumers?.map((c) => c.queue) ?? [];
+    expect(prodConsumerQueues).toEqual(['vip-outbox-queue-prod', 'vip-outbox-dlq-prod']);
+    for (const q of prodConsumerQueues) {
+      expect(currentRepoCfg.env?.staging?.queues?.consumers?.map((c) => c.queue)).not.toContain(q);
+      expect(currentRepoCfg.queues?.consumers?.map((c) => c.queue) ?? []).not.toContain(q);
+    }
+
+    // 6. Root deployment rejection
+    const rootDeployRes = validateWranglerDeploymentConfig(currentRepoCfg, {
+      targetEnv: 'top-level',
+    });
+    expect(rootDeployRes.localConfigValid).toBe(false);
+    expect(rootDeployRes.readyToDeploy).toBe(false);
+    expect(rootDeployRes.liveWorkerReplacementRisk).toBe(true);
+    expect(rootDeployRes.issues.map((i) => i.code)).toContain('ROOT_DEPLOYMENT_FORBIDDEN');
+
+    const rootCliRes = runPredeployCheck({
+      argv: ['--target=top-level'],
+      env: {},
+    });
+    expect(rootCliRes.allowed).toBe(false);
+    expect(rootCliRes.exitCode).toBe(1);
+    expect(rootCliRes.blockingIssueCodes).toContain('ROOT_DEPLOYMENT_FORBIDDEN');
+
+    // 7. Production deployment rejection
+    const prodCliRes = runPredeployCheck({
+      argv: ['--target=production'],
+      env: {},
+    });
+    expect(prodCliRes.allowed).toBe(false);
+    expect(prodCliRes.exitCode).toBe(1);
+    expect(prodCliRes.blockingIssueCodes).toEqual(
+      expect.arrayContaining([
+        'PRODUCTION_BLOCKED_IN_TEMPORARY_STAGING_PHASE',
+        'PLACEHOLDER_D1_DATABASE_ID',
+      ])
+    );
+
+    // 8. Missing explicit targetEnv fails closed with MISSING_EXPLICIT_TARGET_ENV
+    const missingTargetRes = validateWranglerDeploymentConfig(currentRepoCfg);
+    expect(missingTargetRes.localConfigValid).toBe(false);
+    expect(missingTargetRes.readyToDeploy).toBe(false);
+    expect(missingTargetRes.issues.map((i) => i.code)).toEqual(['MISSING_EXPLICIT_TARGET_ENV']);
+
+    const missingTargetCliRes = runPredeployCheck({
+      argv: [],
+      env: {},
+    });
+    expect(missingTargetCliRes.allowed).toBe(false);
+    expect(missingTargetCliRes.exitCode).toBe(1);
+    expect(missingTargetCliRes.blockingIssueCodes).toContain('MISSING_EXPLICIT_TARGET_ENV');
+
+    // 9. CI override mismatch fails closed before Wrangler can override the Worker name to auto-reply-bot
+    const ciMismatchCliRes = runPredeployCheck({
+      argv: ['--target=staging'],
+      env: { WRANGLER_CI_OVERRIDE_NAME: 'auto-reply-bot' },
+    });
+    expect(ciMismatchCliRes.allowed).toBe(false);
+    expect(ciMismatchCliRes.exitCode).toBe(1);
+    expect(ciMismatchCliRes.blockingIssueCodes).toContain('CI_OVERRIDE_NAME_MISMATCH');
+
+    // 10. Direct deployment guard hook verification & 11. Approved staging pre-deploy guard execution
+    const missingHookCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
+    delete missingHookCfg.env!.staging.build;
+    const missingHookRes = validateWranglerDeploymentConfig(missingHookCfg, {
+      targetEnv: 'staging',
+    });
+    expect(missingHookRes.localConfigValid).toBe(false);
+    expect(missingHookRes.issues.map((i) => i.code)).toContain('MISSING_PREDEPLOY_BUILD_COMMAND_HOOK');
+
+    const stagingCliPassNoCi = runPredeployCheck({
+      argv: ['--target=staging'],
+      env: {},
+    });
+    expect(stagingCliPassNoCi.allowed).toBe(true);
+    expect(stagingCliPassNoCi.exitCode).toBe(0);
+    expect(stagingCliPassNoCi.guardResult.resolvedWorkerName).toBe(EXPECTED_STAGING_WORKER_NAME);
+
+    const stagingCliPassMatchingCi = runPredeployCheck({
+      argv: ['--target=staging'],
+      env: { WRANGLER_CI_OVERRIDE_NAME: EXPECTED_STAGING_WORKER_NAME },
+    });
+    expect(stagingCliPassMatchingCi.allowed).toBe(true);
+    expect(stagingCliPassMatchingCi.exitCode).toBe(0);
+
+    // Verify package.json scripts: predeploy:staging, deploy:staging (--env staging --no-x-provision), deploy:staging:dry-run, and NO generic deploy script
+    expect(pkgJson.scripts?.['predeploy:staging']).toBe('tsx scripts/predeploy-check.ts --target=staging');
+    expect(pkgJson.scripts?.['deploy:staging']).toBe('wrangler deploy --env staging --no-x-provision');
+    expect(pkgJson.scripts?.['deploy:staging:dry-run']).toContain('wrangler deploy --env staging --no-x-provision --dry-run');
+    expect(pkgJson.scripts).not.toHaveProperty('deploy');
   });
 });
 

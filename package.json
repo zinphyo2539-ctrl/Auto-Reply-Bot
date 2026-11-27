@@ -12,7 +12,10 @@
     "test": "vitest run",
     "test:unit": "vitest run test/worker.test.ts",
     "test:workerd": "vitest run test/workerd.runtime.test.ts",
-    "build:worker": "esbuild src/worker/index.ts --bundle --format=esm --target=es2022 --outfile=dist-worker/index.js"
+    "build:worker": "esbuild src/worker/index.ts --bundle --format=esm --target=es2022 --outfile=dist-worker/index.js",
+    "predeploy:staging": "tsx scripts/predeploy-check.ts --target=staging",
+    "deploy:staging": "wrangler deploy --env staging --no-x-provision",
+    "deploy:staging:dry-run": "tsx scripts/predeploy-check.ts --target=staging && wrangler deploy --env staging --no-x-provision --dry-run"
   },
   "dependencies": {
     "@cloudflare/workers-types": "^5.20261125.1",

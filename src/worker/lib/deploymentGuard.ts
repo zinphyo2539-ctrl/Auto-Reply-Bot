@@ -1,6 +1,14 @@
 import { redactLogObject } from './logger';
 
-export const EXPECTED_ARCHITECTURE_B_WORKER_NAME = 'auto-reply-bot';
+export const EXPECTED_ROOT_WORKER_NAME = 'auto-reply-bot';
+export const EXPECTED_ARCHITECTURE_B_WORKER_NAME = EXPECTED_ROOT_WORKER_NAME;
+export const EXPECTED_STAGING_WORKER_NAME = 'auto-reply-bot-staging';
+export const EXPECTED_PRODUCTION_WORKER_NAME = 'auto-reply-bot-production';
+
+export const CONFIRMED_STAGING_D1_DATABASE_NAME = 'vip-gaming-d1-staging';
+export const CONFIRMED_STAGING_D1_DATABASE_ID = 'bf4ea8f0-9212-4028-bc3b-00f274d44413';
+export const CONFIRMED_STAGING_PRIMARY_QUEUE = 'vip-outbox-queue-staging';
+export const CONFIRMED_STAGING_DLQ = 'vip-outbox-dlq-staging';
 
 export const DASHBOARD_MANAGED_VAR_KEYS = [
   'TELEGRAM_BOT_USERNAME',
@@ -85,9 +93,16 @@ export interface WranglerQueueConsumerConfig {
   dead_letter_queue?: string;
 }
 
+export interface WranglerBuildConfig {
+  command?: string;
+  cwd?: string;
+  watch_dir?: string | string[];
+}
+
 export interface WranglerEnvironmentScopeConfig {
   name?: string;
   keep_vars?: boolean;
+  build?: WranglerBuildConfig;
   triggers?: {
     crons?: string[];
   };
@@ -149,8 +164,12 @@ export interface DeploymentGuardOptions {
 
 export type DeploymentGuardIssueCode =
   | 'INVALID_CONFIG_OBJECT'
+  | 'MISSING_EXPLICIT_TARGET_ENV'
   | 'INCONSISTENT_WORKER_IDENTITY'
   | 'ROOT_STAGING_WORKER_IDENTITY_COLLISION'
+  | 'ROOT_DEPLOYMENT_FORBIDDEN'
+  | 'ROOT_RESOURCE_BINDINGS_FORBIDDEN'
+  | 'MISSING_PREDEPLOY_BUILD_COMMAND_HOOK'
   | 'LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED'
   | 'MISSING_TOP_LEVEL_KEEP_VARS'
   | 'INVALID_NAMED_ENV_KEEP_VARS'
@@ -167,6 +186,7 @@ export type DeploymentGuardIssueCode =
   | 'MISSING_D1_BINDING'
   | 'PLACEHOLDER_D1_DATABASE_ID'
   | 'INVALID_D1_DATABASE_ID'
+  | 'STAGING_RESOURCE_IDENTITY_MISMATCH'
   | 'STAGING_TOP_LEVEL_ENV_MISMATCH'
   | 'STAGING_PRODUCTION_RESOURCE_COLLISION'
   | 'MISSING_QUEUE_PRODUCER'
@@ -188,38 +208,13 @@ export interface DeploymentGuardIssue {
 }
 
 export interface DeploymentGuardResult {
-  /**
-   * 1. Local configuration structure & policy validity (wrangler.jsonc + .env.example).
-   * Note: A local check is strictly advisory and CANNOT prevent an externally configured Cloudflare Workers Builds pipeline from running.
-   */
   localConfigValid: boolean;
-  /**
-   * 2. External Cloudflare staging resource readiness (requires real D1 UUID in wrangler.jsonc AND verified remote D1 + migrations + primary Queue + DLQ).
-   */
   stagingResourceReady: boolean;
-  /**
-   * 3. External Secret configuration readiness (requires zero plaintext secret leaks AND explicit verification of all 4 required Cloudflare Secrets).
-   */
   secretConfigReady: boolean;
-  /**
-   * 4. Admin notification route readiness (requires verified Dashboard routing variables and at least one verified admin notification route / started SUPER_ADMIN).
-   */
   adminNotificationReady: boolean;
-  /**
-   * 5. Deployment authorization (never true automatically; requires all 4 readiness states + explicitOwnerAuthorization + live-worker replacement risk acknowledgment when targeting auto-reply-bot).
-   */
   deploymentAuthorized: boolean;
-  /**
-   * Aggregate readiness flag (true only when localConfigValid, stagingResourceReady, secretConfigReady, and adminNotificationReady are all true, plus deploymentAuthorized when requireExplicitAuthorization is true).
-   */
   readyToDeploy: boolean;
-  /**
-   * True when the resolved deployment target is the existing live Worker "auto-reply-bot" under temporary_staging mode, which would replace the currently deployed live Worker receiving 100% traffic.
-   */
   liveWorkerReplacementRisk: boolean;
-  /**
-   * Explicit boundary reminder that this guard is a local repository check only, not Cloudflare IAM or a remote CI/CD lock.
-   */
   advisoryScope: 'LOCAL_REPOSITORY_CHECK_ONLY_NOT_REMOTE_CI_OR_IAM_LOCK';
   resolvedWorkerName: string | null;
   targetEnv: string;
@@ -237,7 +232,6 @@ export function isPlaceholderD1DatabaseId(databaseId: unknown): boolean {
   if (/^0{8}-0{4}-0{4}-0{4}-0{12}$/.test(trimmed)) {
     return true;
   }
-  // Reject trivial single-repeated-character synthetic UUIDs (e.g. 11111111-1111-4111-8111-111111111111)
   const hexOnly = trimmed.replace(/-/g, '').toLowerCase();
   if (hexOnly.length === 32 && new Set(hexOnly.split('')).size <= 2) {
     return true;
@@ -331,19 +325,11 @@ function validateVarsBlock(
   }
 
   if (vars.ENVIRONMENT !== expectedEnvironmentValue) {
-    if (scopeName === 'top-level' && expectedEnvironmentValue === 'staging') {
-      issues.push({
-        code: 'TOP_LEVEL_NOT_STAGING_IN_ARCHITECTURE_B',
-        scope: scopeName,
-        message: `[${scopeName}] Temporary Architecture B requires top-level vars.ENVIRONMENT to be "staging" (found "${String(vars.ENVIRONMENT ?? '')}").`,
-      });
-    } else {
-      issues.push({
-        code: 'MISSING_STATIC_VAR',
-        scope: scopeName,
-        message: `[${scopeName}] Expected vars.ENVIRONMENT to be "${expectedEnvironmentValue}" (found "${String(vars.ENVIRONMENT ?? '')}").`,
-      });
-    }
+    issues.push({
+      code: 'MISSING_STATIC_VAR',
+      scope: scopeName,
+      message: `[${scopeName}] Expected vars.ENVIRONMENT to be "${expectedEnvironmentValue}" (found "${String(vars.ENVIRONMENT ?? '')}").`,
+    });
   }
 }
 
@@ -413,6 +399,17 @@ function validateScopeBindings(
           scope: scopeName,
           message: `[${scopeName}] D1 binding "DB" has malformed UUID database_id "${String(dbBinding.database_id ?? '')}".`,
         });
+      } else if (scopeName === 'env.staging') {
+        if (
+          dbBinding.database_name !== CONFIRMED_STAGING_D1_DATABASE_NAME ||
+          dbBinding.database_id?.trim().toLowerCase() !== CONFIRMED_STAGING_D1_DATABASE_ID
+        ) {
+          issues.push({
+            code: 'STAGING_RESOURCE_IDENTITY_MISMATCH',
+            scope: scopeName,
+            message: `[${scopeName}] Staging D1 binding "DB" must use database_name "${CONFIRMED_STAGING_D1_DATABASE_NAME}" and confirmed UUID "${CONFIRMED_STAGING_D1_DATABASE_ID}" (found "${dbBinding.database_name ?? ''}" / "${dbBinding.database_id ?? ''}").`,
+          });
+        }
       }
     }
   }
@@ -438,6 +435,14 @@ function validateScopeBindings(
       message: `[${scopeName}] Missing Queue producer with binding "OUTBOX_QUEUE" and a non-empty queue name.`,
     });
     return;
+  }
+
+  if (scopeName === 'env.staging' && outboxProducer.queue !== CONFIRMED_STAGING_PRIMARY_QUEUE) {
+    issues.push({
+      code: 'STAGING_RESOURCE_IDENTITY_MISMATCH',
+      scope: scopeName,
+      message: `[${scopeName}] Staging Queue producer "OUTBOX_QUEUE" must target "${CONFIRMED_STAGING_PRIMARY_QUEUE}" (found "${outboxProducer.queue}").`,
+    });
   }
 
   if (!Array.isArray(consumers) || consumers.length === 0) {
@@ -469,6 +474,14 @@ function validateScopeBindings(
   }
 
   const dlqName = primaryConsumer.dead_letter_queue;
+  if (scopeName === 'env.staging' && dlqName !== CONFIRMED_STAGING_DLQ) {
+    issues.push({
+      code: 'STAGING_RESOURCE_IDENTITY_MISMATCH',
+      scope: scopeName,
+      message: `[${scopeName}] Staging primary Queue consumer must configure dead_letter_queue "${CONFIRMED_STAGING_DLQ}" (found "${dlqName}").`,
+    });
+  }
+
   if (!dlqName.toLowerCase().includes('dlq')) {
     issues.push({
       code: 'INVALID_DLQ_CONFIGURATION',
@@ -493,95 +506,175 @@ function validateScopeBindings(
   }
 }
 
-function validateCrossEnvironmentConsistency(
+function validatePredeployBuildCommandHooks(
   cfg: WranglerRootConfig,
   issues: DeploymentGuardIssue[]
 ): void {
-  const topD1 = cfg.d1_databases?.find((d) => d.binding === 'DB');
-  const topProducer = cfg.queues?.producers?.find((p) => p.binding === 'OUTBOX_QUEUE');
-  const topPrimaryConsumer = cfg.queues?.consumers?.find((c) => c.queue === topProducer?.queue);
+  const expectedHooks: ReadonlyArray<{
+    scopeName: string;
+    build: WranglerBuildConfig | undefined;
+    requiredFlag: string;
+  }> = [
+    {
+      scopeName: 'top-level',
+      build: cfg.build,
+      requiredFlag: '--target=top-level',
+    },
+    {
+      scopeName: 'env.staging',
+      build: cfg.env?.staging?.build,
+      requiredFlag: '--target=staging',
+    },
+    {
+      scopeName: 'env.production',
+      build: cfg.env?.production?.build,
+      requiredFlag: '--target=production',
+    },
+  ];
 
-  // 1. Ensure top-level temporary staging and env.staging do not diverge on D1 or Queue resource names/IDs
-  const stagingEnv = cfg.env?.staging;
-  if (stagingEnv) {
-    const stgD1 = stagingEnv.d1_databases?.find((d) => d.binding === 'DB');
-    const stgProducer = stagingEnv.queues?.producers?.find((p) => p.binding === 'OUTBOX_QUEUE');
-    const stgPrimaryConsumer = stagingEnv.queues?.consumers?.find(
-      (c) => c.queue === stgProducer?.queue
-    );
-
-    if (
-      topD1 &&
-      stgD1 &&
-      (topD1.database_name !== stgD1.database_name || topD1.database_id !== stgD1.database_id)
-    ) {
+  for (const hook of expectedHooks) {
+    const cmd = typeof hook.build?.command === 'string' ? hook.build.command.trim() : '';
+    if (!cmd || !cmd.includes('scripts/predeploy-check.ts') || !cmd.includes(hook.requiredFlag)) {
       issues.push({
-        code: 'STAGING_TOP_LEVEL_ENV_MISMATCH',
-        scope: 'env.staging',
-        message: `[env.staging] D1 binding "DB" (${stgD1.database_name} / ${stgD1.database_id}) diverges from top-level temporary staging D1 (${topD1.database_name} / ${topD1.database_id}). Keep both synchronized under Architecture B.`,
-      });
-    }
-
-    if (
-      topProducer &&
-      stgProducer &&
-      (topProducer.queue !== stgProducer.queue ||
-        topPrimaryConsumer?.dead_letter_queue !== stgPrimaryConsumer?.dead_letter_queue)
-    ) {
-      issues.push({
-        code: 'STAGING_TOP_LEVEL_ENV_MISMATCH',
-        scope: 'env.staging',
-        message: `[env.staging] Queue configuration (${stgProducer.queue} / ${stgPrimaryConsumer?.dead_letter_queue ?? ''}) diverges from top-level temporary staging Queue (${topProducer.queue} / ${topPrimaryConsumer?.dead_letter_queue ?? ''}).`,
+        code: 'MISSING_PREDEPLOY_BUILD_COMMAND_HOOK',
+        scope: hook.scopeName,
+        message: `[${hook.scopeName}] Missing or invalid Wrangler "build.command" pre-deploy guard hook (must execute "scripts/predeploy-check.ts ${hook.requiredFlag}").`,
       });
     }
   }
+}
 
-  // 2. Ensure staging (top-level or env.staging) never collides with env.production D1 or Queue resources
+function validateRootZeroBindingsAndCrossEnvironmentIsolation(
+  cfg: WranglerRootConfig,
+  issues: DeploymentGuardIssue[]
+): void {
+  // 1. Root scope must contain NO D1 bindings, NO Queue bindings, NO runtime vars, and NO Cron triggers
+  const hasRootD1 = Array.isArray(cfg.d1_databases) && cfg.d1_databases.length > 0;
+  const hasRootQueueProducers =
+    Array.isArray(cfg.queues?.producers) && cfg.queues!.producers!.length > 0;
+  const hasRootQueueConsumers =
+    Array.isArray(cfg.queues?.consumers) && cfg.queues!.consumers!.length > 0;
+  const hasRootVars =
+    cfg.vars !== undefined &&
+    typeof cfg.vars === 'object' &&
+    Object.keys(cfg.vars).length > 0;
+  const hasRootCrons =
+    Array.isArray(cfg.triggers?.crons) && cfg.triggers!.crons!.length > 0;
+
+  if (
+    hasRootD1 ||
+    hasRootQueueProducers ||
+    hasRootQueueConsumers ||
+    hasRootVars ||
+    hasRootCrons
+  ) {
+    issues.push({
+      code: 'ROOT_RESOURCE_BINDINGS_FORBIDDEN',
+      scope: 'top-level',
+      message:
+        '[top-level] Root Wrangler scope must contain zero D1 bindings, Queue bindings, runtime vars, or Cron triggers under Phase 6.3 isolation so the existing "auto-reply-bot" Worker is never targeted or collided with.',
+    });
+  }
+
+  // If root vars were erroneously added, also inspect them for secret/dashboard leaks
+  if (hasRootVars) {
+    validateVarsBlock('top-level', cfg.vars, 'staging', issues);
+  }
+
+  const stgEnv = cfg.env?.staging;
   const prodEnv = cfg.env?.production;
-  if (prodEnv) {
+
+  const stgD1 = stgEnv?.d1_databases?.find((d) => d.binding === 'DB');
+  const stgProducer = stgEnv?.queues?.producers?.find((p) => p.binding === 'OUTBOX_QUEUE');
+  const stgConsumers = stgEnv?.queues?.consumers ?? [];
+  const stgQueueNames = new Set<string>(
+    [
+      stgProducer?.queue,
+      ...stgConsumers.map((c) => c.queue),
+      ...stgConsumers.map((c) => c.dead_letter_queue),
+    ].filter((q): q is string => typeof q === 'string' && q.trim().length > 0)
+  );
+
+  // 2. Check collisions between env.staging and env.production
+  if (stgEnv && prodEnv) {
     const prodD1 = prodEnv.d1_databases?.find((d) => d.binding === 'DB');
     const prodProducer = prodEnv.queues?.producers?.find((p) => p.binding === 'OUTBOX_QUEUE');
-    const prodPrimaryConsumer = prodEnv.queues?.consumers?.find(
-      (c) => c.queue === prodProducer?.queue
+    const prodConsumers = prodEnv.queues?.consumers ?? [];
+    const prodQueueNames = new Set<string>(
+      [
+        prodProducer?.queue,
+        ...prodConsumers.map((c) => c.queue),
+        ...prodConsumers.map((c) => c.dead_letter_queue),
+      ].filter((q): q is string => typeof q === 'string' && q.trim().length > 0)
     );
 
-    if (topD1 && prodD1) {
-      if (topD1.database_name && topD1.database_name === prodD1.database_name) {
+    if (stgD1 && prodD1) {
+      if (stgD1.database_name && stgD1.database_name === prodD1.database_name) {
         issues.push({
           code: 'STAGING_PRODUCTION_RESOURCE_COLLISION',
-          scope: 'top-level',
-          message: `Staging and Production D1 bindings share the same database_name "${topD1.database_name}". Staging and Production databases must be strictly isolated.`,
+          scope: 'env.production',
+          message: `Staging and Production D1 bindings share the same database_name "${stgD1.database_name}". Staging and Production databases must be strictly isolated.`,
         });
       }
       if (
-        !isPlaceholderD1DatabaseId(topD1.database_id) &&
+        stgD1.database_id &&
+        prodD1.database_id &&
+        !isPlaceholderD1DatabaseId(stgD1.database_id) &&
         !isPlaceholderD1DatabaseId(prodD1.database_id) &&
-        topD1.database_id === prodD1.database_id
+        stgD1.database_id.trim().toLowerCase() === prodD1.database_id.trim().toLowerCase()
       ) {
         issues.push({
           code: 'STAGING_PRODUCTION_RESOURCE_COLLISION',
-          scope: 'top-level',
-          message: `Staging and Production D1 bindings share the same database_id "${String(topD1.database_id)}". Staging and Production databases must be strictly isolated.`,
+          scope: 'env.production',
+          message: `Staging and Production D1 bindings share the same database_id "${stgD1.database_id}". Staging and Production databases must be strictly isolated.`,
         });
       }
     }
 
-    if (topProducer && prodProducer) {
-      if (topProducer.queue && topProducer.queue === prodProducer.queue) {
+    for (const qName of stgQueueNames) {
+      if (prodQueueNames.has(qName)) {
         issues.push({
           code: 'STAGING_PRODUCTION_RESOURCE_COLLISION',
-          scope: 'top-level',
-          message: `Staging and Production OUTBOX_QUEUE bindings share the same queue "${topProducer.queue}".`,
+          scope: 'env.production',
+          message: `Staging and Production Queue configurations share queue "${qName}". Queue producers, consumers, and DLQs must be strictly disjoint.`,
         });
       }
+    }
+  }
+
+  // 3. Also detect if root erroneously references any staging or production D1/Queue resource
+  if (hasRootD1) {
+    for (const rootD1 of cfg.d1_databases ?? []) {
       if (
-        topPrimaryConsumer?.dead_letter_queue &&
-        topPrimaryConsumer.dead_letter_queue === prodPrimaryConsumer?.dead_letter_queue
+        stgD1 &&
+        ((rootD1.database_name && rootD1.database_name === stgD1.database_name) ||
+          (rootD1.database_id &&
+            !isPlaceholderD1DatabaseId(rootD1.database_id) &&
+            rootD1.database_id.trim().toLowerCase() === stgD1.database_id?.trim().toLowerCase()))
       ) {
         issues.push({
           code: 'STAGING_PRODUCTION_RESOURCE_COLLISION',
           scope: 'top-level',
-          message: `Staging and Production dead_letter_queue share the same queue "${topPrimaryConsumer.dead_letter_queue}".`,
+          message: `[top-level] Root D1 binding collides with staging D1 resource "${stgD1.database_name}" (${stgD1.database_id}).`,
+        });
+      }
+    }
+  }
+
+  if (hasRootQueueProducers || hasRootQueueConsumers) {
+    const rootQueueNames = new Set<string>(
+      [
+        ...(cfg.queues?.producers ?? []).map((p) => p.queue),
+        ...(cfg.queues?.consumers ?? []).map((c) => c.queue),
+        ...(cfg.queues?.consumers ?? []).map((c) => c.dead_letter_queue),
+      ].filter((q): q is string => typeof q === 'string' && q.trim().length > 0)
+    );
+    for (const qName of rootQueueNames) {
+      if (stgQueueNames.has(qName)) {
+        issues.push({
+          code: 'STAGING_PRODUCTION_RESOURCE_COLLISION',
+          scope: 'top-level',
+          message: `[top-level] Root Queue configuration collides with staging queue "${qName}".`,
         });
       }
     }
@@ -592,7 +685,9 @@ export function validateWranglerDeploymentConfig(
   rawConfig: unknown,
   options: DeploymentGuardOptions = {}
 ): DeploymentGuardResult {
-  const targetEnv = options.targetEnv ?? 'top-level';
+  const rawTargetEnv =
+    typeof options.targetEnv === 'string' ? options.targetEnv.trim() : '';
+  const targetEnv = rawTargetEnv || 'unspecified';
   const phaseMode: DeploymentPhaseMode = options.phaseMode ?? 'temporary_staging';
   const issues: DeploymentGuardIssue[] = [];
 
@@ -619,15 +714,38 @@ export function validateWranglerDeploymentConfig(
     };
   }
 
+  if (!rawTargetEnv) {
+    issues.push({
+      code: 'MISSING_EXPLICIT_TARGET_ENV',
+      scope: 'options.targetEnv',
+      message:
+        'Explicit targetEnv ("staging" | "production" | "top-level") is required. Missing targetEnv fails closed.',
+    });
+    return {
+      localConfigValid: false,
+      stagingResourceReady: false,
+      secretConfigReady: false,
+      adminNotificationReady: false,
+      deploymentAuthorized: false,
+      readyToDeploy: false,
+      liveWorkerReplacementRisk: false,
+      advisoryScope: 'LOCAL_REPOSITORY_CHECK_ONLY_NOT_REMOTE_CI_OR_IAM_LOCK',
+      resolvedWorkerName: null,
+      targetEnv,
+      phaseMode,
+      issues,
+    };
+  }
+
   const cfg = rawConfig as WranglerRootConfig;
   const baseName = typeof cfg.name === 'string' && cfg.name.trim() ? cfg.name.trim() : null;
 
-  // 0. Architecture B Worker identity check
-  if (phaseMode === 'temporary_staging' && baseName !== EXPECTED_ARCHITECTURE_B_WORKER_NAME) {
+  // 0. Root Worker identity preservation check ("auto-reply-bot")
+  if (baseName !== EXPECTED_ROOT_WORKER_NAME) {
     issues.push({
       code: 'INCONSISTENT_WORKER_IDENTITY',
       scope: 'top-level',
-      message: `Top-level Worker name must be "${EXPECTED_ARCHITECTURE_B_WORKER_NAME}" under Architecture B temporary staging mode (found "${String(cfg.name ?? '')}").`,
+      message: `Top-level Worker name must remain "${EXPECTED_ROOT_WORKER_NAME}" so "--env staging" derives "${EXPECTED_STAGING_WORKER_NAME}" and existing Worker identity is preserved (found "${String(cfg.name ?? '')}").`,
     });
   }
 
@@ -667,22 +785,38 @@ export function validateWranglerDeploymentConfig(
     }
   }
 
-  // 3. Validate all vars blocks across top-level, env.staging, and env.production
-  validateVarsBlock('top-level', cfg.vars, 'staging', issues);
+  // 3. Validate pre-deploy build.command hooks and zero-root-binding isolation
+  validatePredeployBuildCommandHooks(cfg, issues);
+  validateRootZeroBindingsAndCrossEnvironmentIsolation(cfg, issues);
+
+  // 4. Validate vars blocks on env.staging and env.production
   if (cfg.env?.staging) {
     validateVarsBlock('env.staging', cfg.env.staging.vars, 'staging', issues);
-  }
-  if (cfg.env?.production) {
-    validateVarsBlock('env.production', cfg.env.production.vars, 'production', issues);
+  } else {
+    issues.push({
+      code: 'INVALID_TARGET_ENVIRONMENT',
+      scope: 'env.staging',
+      message: 'Named environment "env.staging" must be defined in wrangler.jsonc.',
+    });
   }
 
-  // 4. Target environment selection & phase mode guard
+  if (cfg.env?.production) {
+    validateVarsBlock('env.production', cfg.env.production.vars, 'production', issues);
+  } else {
+    issues.push({
+      code: 'INVALID_TARGET_ENVIRONMENT',
+      scope: 'env.production',
+      message: 'Named environment "env.production" must be defined in wrangler.jsonc.',
+    });
+  }
+
+  // 5. Target environment selection & phase mode guard
   const allowedTargets = new Set(['top-level', 'staging', 'production']);
   if (!allowedTargets.has(targetEnv)) {
     issues.push({
       code: 'INVALID_TARGET_ENVIRONMENT',
       scope: targetEnv,
-      message: `Invalid target environment "${targetEnv}". Allowed targets: top-level, staging, production.`,
+      message: `Invalid target environment "${targetEnv}". Allowed targets: staging, production, top-level.`,
     });
     return {
       localConfigValid: false,
@@ -700,12 +834,21 @@ export function validateWranglerDeploymentConfig(
     };
   }
 
+  if (targetEnv === 'top-level') {
+    issues.push({
+      code: 'ROOT_DEPLOYMENT_FORBIDDEN',
+      scope: 'top-level',
+      message:
+        '[top-level] Direct root deployment targeting "auto-reply-bot" is strictly forbidden under Phase 6.3 isolation to protect the existing Worker v7. Deploy exclusively to "--env staging" ("auto-reply-bot-staging").',
+    });
+  }
+
   if (targetEnv === 'production' && phaseMode === 'temporary_staging') {
     issues.push({
       code: 'PRODUCTION_BLOCKED_IN_TEMPORARY_STAGING_PHASE',
       scope: 'env.production',
       message:
-        'Accidental production deployment blocked: repository is currently locked in Architecture B temporary staging mode.',
+        'Production deployment blocked: repository is locked in staging-only mode ("auto-reply-bot-staging") and production activation is not authorized.',
     });
   }
 
@@ -746,35 +889,46 @@ export function validateWranglerDeploymentConfig(
           : null;
   }
 
-  // 5. WRANGLER_CI_OVERRIDE_NAME interaction check
+  if (targetEnv === 'staging' && resolvedWorkerName !== EXPECTED_STAGING_WORKER_NAME) {
+    issues.push({
+      code: 'INCONSISTENT_WORKER_IDENTITY',
+      scope: 'env.staging',
+      message: `[env.staging] Staging Worker identity must resolve to "${EXPECTED_STAGING_WORKER_NAME}" (found "${String(resolvedWorkerName ?? '')}").`,
+    });
+  }
+
+  // 6. WRANGLER_CI_OVERRIDE_NAME interaction check
+  // In Wrangler 4.168.0, a mismatched WRANGLER_CI_OVERRIDE_NAME logs a warning and silently overrides the target Worker name.
   if (options.ciOverrideName !== undefined && options.ciOverrideName.trim().length > 0) {
     const override = options.ciOverrideName.trim();
-    if (targetEnv !== 'top-level') {
-      if (!override.endsWith(`-${targetEnv}`)) {
-        issues.push({
-          code: 'CI_OVERRIDE_NAME_MISMATCH',
-          scope: activeScopeName,
-          message: `WRANGLER_CI_OVERRIDE_NAME="${override}" is incompatible with "--env ${targetEnv}" because Wrangler requires the override name to end with "-${targetEnv}" (or overrides the target back to "${override}").`,
-        });
-      } else {
-        resolvedWorkerName = override;
-      }
-    } else if (baseName && override !== baseName) {
+    const expectedForTarget =
+      targetEnv === 'staging'
+        ? EXPECTED_STAGING_WORKER_NAME
+        : targetEnv === 'production'
+          ? EXPECTED_PRODUCTION_WORKER_NAME
+          : EXPECTED_ROOT_WORKER_NAME;
+
+    if (override !== expectedForTarget) {
       issues.push({
         code: 'CI_OVERRIDE_NAME_MISMATCH',
-        scope: 'top-level',
-        message: `WRANGLER_CI_OVERRIDE_NAME="${override}" does not match top-level Worker name "${baseName}".`,
+        scope: activeScopeName,
+        message: `WRANGLER_CI_OVERRIDE_NAME="${override}" mismatches expected target Worker "${expectedForTarget}" for "${activeScopeName}". Blocked before Wrangler 4.168.0 can silently override the Worker name to "${override}".`,
       });
     } else {
       resolvedWorkerName = override;
     }
   }
 
-  // 6. Validate bindings on the selected target scope + cross-environment consistency
-  validateScopeBindings(activeScopeName, activeScope, issues);
-  validateCrossEnvironmentConsistency(cfg, issues);
+  // 7. Validate bindings on the selected target scope (and always validate env.staging bindings)
+  if (targetEnv === 'top-level') {
+    if (cfg.env?.staging) {
+      validateScopeBindings('env.staging', cfg.env.staging, issues);
+    }
+  } else {
+    validateScopeBindings(activeScopeName, activeScope, issues);
+  }
 
-  // 7. Optional .env.example secret declaration check (verifies names & empty values only, never real secrets)
+  // 8. Optional .env.example secret declaration check (verifies names & empty values only, never real secrets)
   if (typeof options.envExampleContent === 'string') {
     for (const secretName of [...REQUIRED_SECRET_KEYS, ...OPTIONAL_ROTATION_SECRET_KEYS]) {
       const declMatch = new RegExp(`^#?\\s*${secretName}=(.*)$`, 'm').exec(
@@ -799,7 +953,7 @@ export function validateWranglerDeploymentConfig(
     }
   }
 
-  // 8. Check for historical plaintext credential bindings on the Dashboard (which keep_vars: true would preserve)
+  // 9. Check for historical plaintext credential bindings on the Dashboard (which keep_vars: true would preserve)
   if (Array.isArray(options.dashboardPlaintextBindingKeys)) {
     const secretKeySet = new Set<string>([
       ...REQUIRED_SECRET_KEYS,
@@ -834,7 +988,7 @@ export function validateWranglerDeploymentConfig(
   );
   const localConfigValid = localConfigIssues.length === 0;
 
-  // 9. External Cloudflare Staging Resource Verification (never defaults to true on empty object)
+  // 10. External Cloudflare Staging Resource Verification (never defaults to true on empty object)
   const extStaging = options.externalVerification?.stagingResources;
   const externalResourcesVerified =
     extStaging !== undefined &&
@@ -855,14 +1009,16 @@ export function validateWranglerDeploymentConfig(
   const resourceIssueCodes = new Set<DeploymentGuardIssueCode>([
     'PLACEHOLDER_D1_DATABASE_ID',
     'INVALID_D1_DATABASE_ID',
+    'STAGING_RESOURCE_IDENTITY_MISMATCH',
     'STAGING_PRODUCTION_RESOURCE_COLLISION',
     'STAGING_TOP_LEVEL_ENV_MISMATCH',
+    'ROOT_RESOURCE_BINDINGS_FORBIDDEN',
     'UNVERIFIED_EXTERNAL_STAGING_RESOURCES',
   ]);
   const resourceIssues = issues.filter((i) => resourceIssueCodes.has(i.code));
   const stagingResourceReady = localConfigValid && resourceIssues.length === 0;
 
-  // 10. External Cloudflare Secret Verification (never defaults to true on empty object)
+  // 11. External Cloudflare Secret Verification (never defaults to true on empty object)
   const extSecrets = options.externalVerification?.secrets;
   const verifiedSecretSet = new Set<string>(
     Array.isArray(extSecrets?.verifiedEncryptedSecretKeys)
@@ -892,7 +1048,7 @@ export function validateWranglerDeploymentConfig(
   const secretIssues = issues.filter((i) => secretIssueCodes.has(i.code));
   const secretConfigReady = secretIssues.length === 0;
 
-  // 11. External Admin Notification Route Verification (never defaults to true on empty object)
+  // 12. External Admin Notification Route Verification (never defaults to true on empty object)
   const extAdmin = options.externalVerification?.adminNotification;
   const hasValidConfiguredGroup =
     extAdmin?.configuredAdminGroupId === undefined ||
@@ -923,22 +1079,28 @@ export function validateWranglerDeploymentConfig(
     });
   }
 
-  // 12. Live Worker Replacement Risk Check (Architecture B targeting existing live "auto-reply-bot" service)
+  // 13. Live Worker Replacement Risk Check
+  // True only if the deployment would target or override to the existing live "auto-reply-bot" Worker
+  const effectiveCiOverride =
+    typeof options.ciOverrideName === 'string' && options.ciOverrideName.trim().length > 0
+      ? options.ciOverrideName.trim()
+      : null;
   const liveWorkerReplacementRisk =
-    phaseMode === 'temporary_staging' &&
-    resolvedWorkerName === EXPECTED_ARCHITECTURE_B_WORKER_NAME;
+    targetEnv === 'top-level' ||
+    resolvedWorkerName === EXPECTED_ROOT_WORKER_NAME ||
+    effectiveCiOverride === EXPECTED_ROOT_WORKER_NAME;
 
   if (liveWorkerReplacementRisk && options.acknowledgeLiveWorkerReplacementRisk !== true) {
     issues.push({
       code: 'LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED',
       scope: activeScopeName,
-      message: `[${activeScopeName}] BLOCKER: Target Worker "${EXPECTED_ARCHITECTURE_B_WORKER_NAME}" is an existing live Cloudflare Worker receiving 100% traffic. Deploying Architecture B to "${EXPECTED_ARCHITECTURE_B_WORKER_NAME}" will replace the currently running Worker with staging configuration. Owner must explicitly authorize temporary replacement (acknowledgeLiveWorkerReplacementRisk: true) or authorize a separate staging Worker identity.`,
+      message: `[${activeScopeName}] BLOCKER: Target Worker "${EXPECTED_ROOT_WORKER_NAME}" is an existing live Cloudflare Worker (v7). Overwriting "${EXPECTED_ROOT_WORKER_NAME}" is blocked under Phase 6.3 isolation.`,
     });
   }
 
   const deploymentAuthorized =
     options.explicitOwnerAuthorization === true &&
-    (!liveWorkerReplacementRisk || options.acknowledgeLiveWorkerReplacementRisk === true) &&
+    !liveWorkerReplacementRisk &&
     localConfigValid &&
     stagingResourceReady &&
     secretConfigReady &&
@@ -949,7 +1111,7 @@ export function validateWranglerDeploymentConfig(
       code: 'DEPLOYMENT_NOT_AUTHORIZED',
       scope: activeScopeName,
       message:
-        'Deployment execution is not authorized. A local repository check never authorizes deployment; verified external resources, verified secrets, verified admin notification routing, live-worker replacement acknowledgment, and explicit Owner authorization are required.',
+        'Deployment execution is not authorized. A local repository check never authorizes deployment; verified external resources, verified secrets, verified admin notification routing, zero live-worker replacement risk, and explicit Owner authorization are required.',
     });
   }
 
@@ -958,7 +1120,7 @@ export function validateWranglerDeploymentConfig(
     stagingResourceReady &&
     secretConfigReady &&
     adminNotificationReady &&
-    (!liveWorkerReplacementRisk || options.acknowledgeLiveWorkerReplacementRisk === true) &&
+    !liveWorkerReplacementRisk &&
     (options.requireExplicitAuthorization ? deploymentAuthorized : true);
 
   const sanitizedIssues: DeploymentGuardIssue[] = issues.map((issue) => {
@@ -986,16 +1148,6 @@ export function validateWranglerDeploymentConfig(
   };
 }
 
-/**
- * Explicit pre-deployment gate that requires all 5 states:
- * 1. localConfigValid
- * 2. stagingResourceReady
- * 3. secretConfigReady
- * 4. adminNotificationReady
- * 5. deploymentAuthorized (explicitOwnerAuthorization: true + acknowledgeLiveWorkerReplacementRisk: true when targeting auto-reply-bot)
- *
- * NOTE: This function is a local repository verification gate only and does NOT control Cloudflare IAM or external Cloudflare Workers Builds pipelines.
- */
 export function enforceDeploymentGate(
   rawConfig: unknown,
   options: DeploymentGuardOptions = {}

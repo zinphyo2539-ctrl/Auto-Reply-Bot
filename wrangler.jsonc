@@ -9,60 +9,14 @@
     "enabled": true,
     "head_sampling_rate": 1
   },
-  "triggers": {
-    "crons": [
-      "* * * * *",
-      "*/5 * * * *",
-      "0 20 * * *"
-    ]
-  },
-  "vars": {
-    "ENVIRONMENT": "staging",
-    "OFFICIAL_CHANNEL_URL": "https://t.me/slotmyanmar77777",
-    "GEMINI_MODEL": "gemini-2.5-flash",
-    "APP_TIMEZONE": "Asia/Yangon",
-    "RETENTION_MESSAGES_DAYS": "180",
-    "RETENTION_FINGERPRINTS_DAYS": "365",
-    "RETENTION_AUDIT_DAYS": "365",
-    "RETENTION_WITHDRAWAL_PII_DAYS": "30",
-    "RETENTION_OUTBOX_DAYS": "30",
-    "ENCRYPTION_KEY_VERSION": "1"
-  },
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "vip-gaming-d1-staging",
-      "database_id": "bf4ea8f0-9212-4028-bc3b-00f274d44413",
-      "migrations_dir": "migrations"
-    }
-  ],
-  "queues": {
-    "producers": [
-      {
-        "binding": "OUTBOX_QUEUE",
-        "queue": "vip-outbox-queue-staging"
-      }
-    ],
-    "consumers": [
-      {
-        "queue": "vip-outbox-queue-staging",
-        "max_batch_size": 10,
-        "max_batch_timeout": 1,
-        "max_retries": 3,
-        "max_concurrency": 5,
-        "dead_letter_queue": "vip-outbox-dlq-staging"
-      },
-      {
-        "queue": "vip-outbox-dlq-staging",
-        "max_batch_size": 10,
-        "max_batch_timeout": 5,
-        "max_retries": 0,
-        "max_concurrency": 1
-      }
-    ]
+  "build": {
+    "command": "npx tsx scripts/predeploy-check.ts --target=top-level"
   },
   "env": {
     "staging": {
+      "build": {
+        "command": "npx tsx scripts/predeploy-check.ts --target=staging"
+      },
       "triggers": {
         "crons": [
           "* * * * *",
@@ -117,6 +71,9 @@
       }
     },
     "production": {
+      "build": {
+        "command": "npx tsx scripts/predeploy-check.ts --target=production"
+      },
       "triggers": {
         "crons": [
           "* * * * *",

@@ -17,66 +17,36 @@
 
 ---
 
-## Worker Metadata & Architecture (Phase 3 — Architecture B Temporary Staging Mode)
+## Worker Metadata & Architecture (Phase 6.3 — Zero-Root-Binding + Isolated Staging Architecture)
 
 | Property | Value |
 | :--- | :--- |
-| **Worker Name (Top-Level Target)** | `auto-reply-bot` |
-| **Cloudflare System Service Tag** | `cf:service=auto-reply-bot` |
-| **Deployment Mode** | Architecture B — Temporary Staging at Top-Level (`ENVIRONMENT = "staging"`) |
+| **Root Worker Name (Protected Base Identity)** | `auto-reply-bot` (Zero root resource bindings; root deployment blocked by `build.command` pre-deploy guard) |
+| **Staging Worker Target (`--env staging`)** | `auto-reply-bot-staging` (`ENVIRONMENT = "staging"`) |
+| **Reserved Production Target (`--env production`)** | `auto-reply-bot-production` (`ENVIRONMENT = "production"`, disabled & unprovisioned) |
 | **Dashboard Variable Persistence** | `"keep_vars": true` (Top-level only) |
-| **Dashboard-Managed Variables** | `TELEGRAM_BOT_USERNAME`, `TELEGRAM_ADMIN_GROUP_ID`, `SUPER_ADMIN_IDS` (Omitted from `wrangler.jsonc` `vars` blocks) |
+| **Dashboard-Managed Variables** | `TELEGRAM_BOT_USERNAME`, `TELEGRAM_ADMIN_GROUP_ID`, `SUPER_ADMIN_IDS` (Omitted from `wrangler.jsonc` `vars` blocks; scoped per Worker service) |
 | **Required Secrets (`secret_text`)** | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `GEMINI_API_KEY`, `WITHDRAWAL_PII_ENCRYPTION_KEY` |
 | **Optional Rotation Secrets** | `TELEGRAM_WEBHOOK_SECRET_PREVIOUS`, `WITHDRAWAL_PII_ENCRYPTION_KEY_PREVIOUS` |
 | **Entry Point** | `src/worker/index.ts` |
 | **Runtime Compatibility** | `compatibility_date = "2025-03-01"`, `compatibility_flags = ["nodejs_compat"]` |
 | **HTTP Router** | Hono (`GET /healthz`, `POST /webhook`) |
-| **Primary Database Binding** | `DB` (Cloudflare D1 `vip-gaming-d1-staging`, migrations in `./migrations`) |
-| **Queue Producer Binding** | `OUTBOX_QUEUE` (Cloudflare Queues `vip-outbox-queue-staging`, DLQ `vip-outbox-dlq-staging`) |
-| **Cron Triggers** | `* * * * *` (Outbox lease recovery), `*/5 * * * *` (SLA reminder & escalation), `0 20 * * *` (02:30 MMT daily retention & PII redaction) |
-
-> **CRITICAL DEPLOYMENT BLOCKER — Architecture B Live Worker Replacement Risk (`auto-reply-bot`):**
-> Because Cloudflare Workers Builds injects `WRANGLER_CI_OVERRIDE_NAME=auto-reply-bot` and runs bare `wrangler deploy`, a root deployment from this repository targets the existing live Cloudflare Worker **`auto-reply-bot`** (`https://auto-reply-bot.zentrymodernization.workers.dev`, currently receiving 100% live traffic at v7) with top-level `"ENVIRONMENT": "staging"` and staging D1/Queue bindings.
-> - **Architecture B CANNOT stage safely without replacing or disrupting the currently deployed `auto-reply-bot` Worker.**
-> - Before any deployment is executed, the Owner must explicitly choose between:
->   1. **Alternative 1 (Authorized Temporary Replacement of `auto-reply-bot`):** Explicitly authorize replacing the live `auto-reply-bot` Worker with staging configuration (`acknowledgeLiveWorkerReplacementRisk: true` + `explicitOwnerAuthorization: true`), accepting service impact on whatever `auto-reply-bot` v7 currently serves.
->   2. **Alternative 2 (Dedicated Separate Staging Worker Identity):** Provision and target a separate dedicated staging Worker service (e.g., `vip-gaming-bot-staging` or `auto-reply-bot-staging` via `npx wrangler deploy --env staging` without `WRANGLER_CI_OVERRIDE_NAME=auto-reply-bot`), leaving the existing live `auto-reply-bot` Worker untouched.
+| **Staging D1 Database Binding (`env.staging`)** | `DB` -> `vip-gaming-d1-staging` (`bf4ea8f0-9212-4028-bc3b-00f274d44413`, migrations in `./migrations`) |
+| **Staging Queue Bindings (`env.staging`)** | `OUTBOX_QUEUE` -> `vip-outbox-queue-staging`, DLQ `vip-outbox-dlq-staging` |
+| **Cron Triggers (`env.staging` & `env.production`)** | `* * * * *` (Outbox lease recovery), `*/5 * * * *` (SLA reminder & escalation), `0 20 * * *` (02:30 MMT daily retention & PII redaction) |
 
 ---
 
-## Phase 3.3 5-State Deployment Readiness Gate (`src/worker/lib/deploymentGuard.ts`)
+## Phase 6.3 Dual-Layer Pre-Deploy Guard (`scripts/predeploy-check.ts` & `src/worker/lib/deploymentGuard.ts`)
 
-`validateWranglerDeploymentConfig` and `enforceDeploymentGate` enforce five distinct fail-closed readiness states:
-1. **`localConfigValid`:** Static local verification of `wrangler.jsonc` and `.env.example` (top-level `"keep_vars": true`, zero `keep_vars` in named environments, 10 static vars, 3 Dashboard-managed vars omitted from `vars`, 4 required secrets + 2 optional rotation secrets omitted from `vars`, all 3 cron schedules `["* * * * *", "*/5 * * * *", "0 20 * * *"]` across top-level/staging/production, `max_retries: 3` on primary queue consumers and `max_retries: 0` on DLQ consumers, and zero root vs. `env.staging` Worker name collision).
-2. **`stagingResourceReady`:** Real non-placeholder staging D1 UUID synchronized across top-level and `env.staging`, isolated from production D1/Queues, AND explicit external verification that staging D1 (`vip-gaming-d1-staging`) and staging Queues (`vip-outbox-queue-staging`, `vip-outbox-dlq-staging`) exist and have migrations `0001`–`0005` applied.
-3. **`secretConfigReady`:** Zero secret names in `wrangler.jsonc` `vars` or historical Dashboard plaintext bindings, AND explicit external verification that all 4 required Secrets (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, `GEMINI_API_KEY`, `WITHDRAWAL_PII_ENCRYPTION_KEY`) are stored as Cloudflare Encrypted Secrets (`secret_text`).
-4. **`adminNotificationReady`:** Explicit external verification that Dashboard-managed variables (`TELEGRAM_BOT_USERNAME`, `TELEGRAM_ADMIN_GROUP_ID`, `SUPER_ADMIN_IDS`) are configured and at least one active `SUPER_ADMIN` has initialized a private DM with the bot (`/start` -> `has_started_bot = 1`).
-5. **`deploymentAuthorized`:** Explicit per-invocation Owner authorization (`explicitOwnerAuthorization === true`) AND explicit acknowledgment of the live Worker replacement risk (`acknowledgeLiveWorkerReplacementRisk === true`) when targeting `auto-reply-bot` in `temporary_staging` mode.
-
-> **Important Scope Boundary:** Local TypeScript deployment guards (`deploymentGuard.ts`) and local test suites are **advisory repository checks only** (`LOCAL_REPOSITORY_CHECK_ONLY_NOT_REMOTE_CI_OR_IAM_LOCK`). They **cannot** inspect remote Cloudflare Dashboard state and **cannot** automatically prevent a remote Cloudflare Workers Builds pipeline from running `npx wrangler deploy` unless the Owner configures the remote Cloudflare Workers Builds **Build Command** to execute `npm run lint && npm test && npm run build:worker` before deployment.
-
----
-
-## Pre-Deployment Security & Historical Plaintext Credential Audit Checklist
-
-Before any separately authorized Cloudflare deployment:
-
-1. **Resolve the Live Worker vs. Staging Identity Blocker:**
-   - Decide between **Alternative 1** (explicitly authorized temporary replacement of `auto-reply-bot` with acknowledged live traffic impact) or **Alternative 2** (dedicated staging Worker service).
-2. **Inspect & Remove Historical Plaintext Credential Bindings (Critical with `"keep_vars": true`):**
-   - `"keep_vars": true` instructs Cloudflare to preserve existing Dashboard plaintext (`plain_text` / `json`) variables across deployments and **does not** automatically convert plaintext variables into encrypted Secrets (`secret_text`).
-   - In **Cloudflare Dashboard -> Workers & Pages -> `auto-reply-bot` -> Settings -> Variables and Secrets**, inspect all existing bindings.
-   - If `GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_WEBHOOK_SECRET`, or `WITHDRAWAL_PII_ENCRYPTION_KEY` exist as **Plaintext (`Text`)** bindings from earlier deployments, **delete those plaintext bindings first** and recreate them strictly as **Encrypted Secrets** (`wrangler secret put <NAME>` or Dashboard **Secret** type).
-   - **Encryption Key Caution:** Do **not** rotate `WITHDRAWAL_PII_ENCRYPTION_KEY` without first verifying whether historical non-redacted withdrawal ciphertexts exist in D1 and preparing a dual-key (`WITHDRAWAL_PII_ENCRYPTION_KEY_PREVIOUS` + incremented `ENCRYPTION_KEY_VERSION`) migration plan.
-3. **Verify Dashboard-Managed Plaintext Variables (`Strategy 1`) & Super Admin `/start` Onboarding:**
-   - Ensure only the 3 non-secret dynamic routing variables (`TELEGRAM_BOT_USERNAME`, `TELEGRAM_ADMIN_GROUP_ID`, `SUPER_ADMIN_IDS`) are stored as Dashboard Plaintext Variables, pointing to staging-dedicated Telegram bot/group resources.
-   - Ensure at least one `SUPER_ADMIN` sends `/start` to the staging bot in private chat (`has_started_bot = 1`). If `TELEGRAM_ADMIN_GROUP_ID` is unconfigured/unreachable and no `SUPER_ADMIN` has started the bot yet, the outbox consumer holds admin alerts in `RETRYABLE_FAILURE` (`ADMIN_NOTIFICATION_HELD_NO_REACHABLE_ADMIN`) and automatically releases them as soon as a `SUPER_ADMIN` runs `/start` or `TELEGRAM_ADMIN_GROUP_ID` is configured.
-4. **Cloudflare Workers Builds Pipeline Gate:**
-   - Configure the Cloudflare Workers Builds **Build Command** to execute:
-     ```bash
-     npm run lint && npm test && npm run build:worker
-     ```
-     before the **Deploy Command** (`npx wrangler deploy`) so that any test or deployment-guard failure aborts the build before Wrangler runs.
+1. **Zero-Root-Binding Protection (`ROOT_RESOURCE_BINDINGS_FORBIDDEN` & `ROOT_DEPLOYMENT_FORBIDDEN`):**
+   - The root scope of `wrangler.jsonc` retains `"name": "auto-reply-bot"` and `"keep_vars": true` (so `--env staging` resolves to `"auto-reply-bot-staging"`), but declares **zero** `d1_databases`, **zero** `queues`, **zero** `vars`, and **zero** `triggers`.
+   - Any bare `npx wrangler deploy` invokes top-level `build.command` (`npx tsx scripts/predeploy-check.ts --target=top-level`) and aborts with exit code `1` before Wrangler can authenticate, provision resources, or touch the existing `auto-reply-bot` (`v7`) Worker.
+2. **Staging Isolation & CI Override Protection (`CI_OVERRIDE_NAME_MISMATCH`):**
+   - `env.staging` (`auto-reply-bot-staging`) exclusively binds `vip-gaming-d1-staging` (`bf4ea8f0-9212-4028-bc3b-00f274d44413`), `vip-outbox-queue-staging`, and `vip-outbox-dlq-staging`.
+   - Both `npm run predeploy:staging` and `env.staging.build.command` (`npx tsx scripts/predeploy-check.ts --target=staging`) verify that `WRANGLER_CI_OVERRIDE_NAME` is either unset or `"auto-reply-bot-staging"`. If `WRANGLER_CI_OVERRIDE_NAME="auto-reply-bot"` is injected by a misconnected CI pipeline, the pre-deploy hook aborts with exit code `1` before Wrangler `4.168.0` can override the target Worker name.
+3. **Production Fail-Closed Lock (`PRODUCTION_BLOCKED_IN_TEMPORARY_STAGING_PHASE`):**
+   - `env.production` (`auto-reply-bot-production`) remains disabled with placeholder D1 UUID `00000000-0000-0000-0000-000000000000` and is blocked by `env.production.build.command` (`npx tsx scripts/predeploy-check.ts --target=production`).
 
 ---
 
@@ -89,6 +59,9 @@ npm run lint
 # Production ESM Worker bundle verification
 npm run build:worker
 
-# Full unit, deployment guard, remediation (F-03, F-06, F-07), and real workerd + Miniflare D1 test suite
+# Full unit, deployment guard, remediation (F-03, F-06, F-07), and real workerd + Miniflare D1 test suite (58 tests)
 npm test
+
+# Non-deploying staging dry-run (executes pre-deploy guard + wrangler deploy --env staging --no-x-provision --dry-run)
+npm run deploy:staging:dry-run
 ```
