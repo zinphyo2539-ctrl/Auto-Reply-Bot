@@ -11,9 +11,23 @@ import { escapeHtml } from '../lib/textChunker';
 export const scheduledDispatcher = {
   async dispatch(env: Env, controller: ScheduledController): Promise<void> {
     switch (controller.cron) {
-      case '* * * * *':
+      case '* * * * *': {
         await this.runLeaseRecoveryCron(env);
+        const scheduledMs =
+          typeof controller.scheduledTime === 'number' &&
+          Number.isFinite(controller.scheduledTime) &&
+          controller.scheduledTime > 0
+            ? controller.scheduledTime
+            : systemClock.now();
+        const scheduledDate = new Date(scheduledMs);
+        if (scheduledDate.getUTCMinutes() % 5 === 0) {
+          await this.runReminderAndEscalationCron(env);
+        }
+        if (scheduledDate.getUTCHours() === 20 && scheduledDate.getUTCMinutes() === 0) {
+          await this.runRetentionCron(env);
+        }
         break;
+      }
       case '*/5 * * * *':
         await this.runReminderAndEscalationCron(env);
         break;

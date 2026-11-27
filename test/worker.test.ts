@@ -1637,7 +1637,7 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       }
     }
 
-    const expectedCrons = ['* * * * *', '*/5 * * * *', '0 20 * * *'];
+    const expectedCrons = ['* * * * *'];
     expect(wranglerCfg.env?.staging?.triggers?.crons).toEqual(expectedCrons);
     expect(wranglerCfg.env?.production?.triggers?.crons).toEqual(expectedCrons);
 

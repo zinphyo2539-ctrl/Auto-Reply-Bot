@@ -43,8 +43,6 @@ export const OPTIONAL_ROTATION_SECRET_KEYS = [
 
 export const EXPECTED_CRON_TRIGGERS = [
   '* * * * *',
-  '*/5 * * * *',
-  '0 20 * * *',
 ] as const;
 
 const PLACEHOLDER_VALUE_PATTERNS: readonly RegExp[] = [
