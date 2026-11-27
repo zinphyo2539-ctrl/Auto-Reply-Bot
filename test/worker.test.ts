@@ -1670,6 +1670,14 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
 
     // Verify top-level, staging, and production D1 & Queue bindings (including DLQ max_retries: 0)
     expect(wranglerCfg.d1_databases?.[0]?.binding).toBe('DB');
+    expect(wranglerCfg.d1_databases?.[0]?.database_name).toBe('vip-gaming-d1-staging');
+    expect(wranglerCfg.d1_databases?.[0]?.database_id).toBe('bf4ea8f0-9212-4028-bc3b-00f274d44413');
+    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.binding).toBe('DB');
+    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.database_name).toBe('vip-gaming-d1-staging');
+    expect(wranglerCfg.env?.staging?.d1_databases?.[0]?.database_id).toBe('bf4ea8f0-9212-4028-bc3b-00f274d44413');
+    expect(wranglerCfg.env?.production?.d1_databases?.[0]?.binding).toBe('DB');
+    expect(wranglerCfg.env?.production?.d1_databases?.[0]?.database_name).toBe('vip-gaming-d1-prod');
+    expect(wranglerCfg.env?.production?.d1_databases?.[0]?.database_id).toBe('00000000-0000-0000-0000-000000000000');
     expect(wranglerCfg.queues?.producers?.[0]?.binding).toBe('OUTBOX_QUEUE');
     const topDlq = wranglerCfg.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-staging');
     const stagingDlq = wranglerCfg.env?.staging?.queues?.consumers?.find((c) => c.queue === 'vip-outbox-dlq-staging');
@@ -2656,9 +2664,9 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
     expect(repoCheck.liveWorkerReplacementRisk).toBe(true);
     expect(repoCheck.advisoryScope).toBe('LOCAL_REPOSITORY_CHECK_ONLY_NOT_REMOTE_CI_OR_IAM_LOCK');
     expect(repoCheck.resolvedWorkerName).toBe('auto-reply-bot');
+    expect(repoCheck.issues.map((i) => i.code)).not.toContain('PLACEHOLDER_D1_DATABASE_ID');
     expect(repoCheck.issues.map((i) => i.code)).toEqual(
       expect.arrayContaining([
-        'PLACEHOLDER_D1_DATABASE_ID',
         'LIVE_WORKER_REPLACEMENT_RISK_UNACKNOWLEDGED',
         'UNVERIFIED_EXTERNAL_STAGING_RESOURCES',
         'UNVERIFIED_EXTERNAL_SECRETS',
@@ -2666,11 +2674,22 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
       ])
     );
 
+    // 1b. Placeholder D1 UUID is rejected with PLACEHOLDER_D1_DATABASE_ID
+    const placeholderD1Cfg: WranglerRootConfig = structuredClone(currentRepoCfg);
+    placeholderD1Cfg.d1_databases![0].database_id = '00000000-0000-0000-0000-000000000000';
+    placeholderD1Cfg.env!.staging.d1_databases![0].database_id = '00000000-0000-0000-0000-000000000000';
+    const placeholderD1Res = validateWranglerDeploymentConfig(placeholderD1Cfg, {
+      targetEnv: 'top-level',
+      phaseMode: 'temporary_staging',
+      ciOverrideName: 'auto-reply-bot',
+      envExampleContent: envExampleRaw,
+    });
+    expect(placeholderD1Res.stagingResourceReady).toBe(false);
+    expect(placeholderD1Res.issues.map((i) => i.code)).toContain('PLACEHOLDER_D1_DATABASE_ID');
+
     // 2. Empty externalVerification: {} must NOT produce false positives
-    const validUuid = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
+    const validUuid = 'bf4ea8f0-9212-4028-bc3b-00f274d44413';
     const readyCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
-    readyCfg.d1_databases![0].database_id = validUuid;
-    readyCfg.env!.staging.d1_databases![0].database_id = validUuid;
 
     const emptyExternalRes = validateWranglerDeploymentConfig(readyCfg, {
       targetEnv: 'top-level',
@@ -2694,7 +2713,7 @@ describe('7777club VIP Gaming Telegram AI Support System — Full Verification S
 
     // 4. Divergent top-level vs env.staging D1 database_id triggers STAGING_TOP_LEVEL_ENV_MISMATCH
     const divergentStagingCfg: WranglerRootConfig = structuredClone(currentRepoCfg);
-    divergentStagingCfg.d1_databases![0].database_id = validUuid;
+    divergentStagingCfg.d1_databases![0].database_id = 'a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d';
     const divergentRes = validateWranglerDeploymentConfig(divergentStagingCfg);
     expect(divergentRes.stagingResourceReady).toBe(false);
     expect(divergentRes.issues.map((i) => i.code)).toContain('STAGING_TOP_LEVEL_ENV_MISMATCH');
