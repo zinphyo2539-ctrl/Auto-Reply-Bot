@@ -54,11 +54,11 @@ const VERIFICATION_ROWS: VerificationRow[] = [
     resultEn: '2 / 2 passed',
   },
   {
-    labelMy: 'Local Wrangler D1 Migrations (0001–0004)',
-    labelEn: 'Local Wrangler D1 Migrations (0001–0004)',
+    labelMy: 'Local Wrangler D1 Migrations (0001–0005)',
+    labelEn: 'Local Wrangler D1 Migrations (0001–0005)',
     command: 'wrangler d1 migrations apply --local',
-    resultMy: '4 / 4 migrations (18 tables)',
-    resultEn: '4 / 4 migrations (18 tables)',
+    resultMy: '5 / 5 migrations (18 tables)',
+    resultEn: '5 / 5 migrations (18 tables)',
   },
 ];
 
@@ -96,12 +96,12 @@ const STAGING_STEPS: StagingStep[] = [
   },
   {
     number: '04',
-    titleMy: 'Remote D1 Migration (0001–0004) နှင့် ခွင့်ပြုချက်ရမှသာ Staging Deploy တင်ပါ',
-    titleEn: 'Apply Remote Migrations (0001–0004) and Deploy Only After Owner Authorization',
+    titleMy: 'Remote D1 Migration (0001–0005) နှင့် ခွင့်ပြုချက်ရမှသာ Staging Deploy တင်ပါ',
+    titleEn: 'Apply Remote Migrations (0001–0005) and Deploy Only After Owner Authorization',
     detailMy:
-      'Migration 0001 မှ 0004 အထိကို remote Staging D1 ပေါ်တွင် apply လုပ်ပြီး npm run lint && npm test စစ်ဆေးအောင်မြင်ကာ Owner မှ live Worker အစားထိုးမှု သို့မဟုတ် သီးခြား staging Worker သတ်မှတ်မှုကို ခွင့်ပြုမှသာ deploy တင်ပါ။',
+      'Migration 0001 မှ 0005 အထိကို remote Staging D1 ပေါ်တွင် apply လုပ်ပြီး npm run lint && npm test စစ်ဆေးအောင်မြင်ကာ Owner မှ live Worker အစားထိုးမှု သို့မဟုတ် သီးခြား staging Worker သတ်မှတ်မှုကို ခွင့်ပြုမှသာ deploy တင်ပါ။',
     detailEn:
-      'Apply migrations 0001 through 0004 to the remote Staging D1 database, verify npm run lint && npm test pass, and deploy only after explicit Owner authorization of the target Worker identity.',
+      'Apply migrations 0001 through 0005 to the remote Staging D1 database, verify npm run lint && npm test pass, and deploy only after explicit Owner authorization of the target Worker identity.',
     snippet:
       'wrangler d1 migrations apply vip-gaming-d1-staging --remote\nnpm run lint && npm test && npm run build:worker',
   },
